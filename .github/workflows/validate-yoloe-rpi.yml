@@ -17,6 +17,10 @@ on:
       - 'farm_robot/sensors/ai_perception.py'
   workflow_dispatch:
 
+concurrency:
+  group: yoloe-validation-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   validate:
     runs-on: ubuntu-24.04
@@ -28,10 +32,10 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install runtime/export dependencies
+      - name: Install runtime dependencies
         run: |
           python -m pip install -U pip
-          python -m pip install 'ultralytics[export]' opencv-python-headless
+          python -m pip install ultralytics opencv-python-headless
 
       - name: Download public bare-furrow validation images
         run: |
