@@ -1,0 +1,60 @@
+name: eval-public-ridge-model
+
+on:
+  push:
+    branches: [eval/ridge-seg-models]
+    paths:
+      - '.github/workflows/eval-public-ridge-model.yml'
+      - 'farm_robot/tools/eval_public_ridge_model.py'
+  workflow_dispatch:
+
+concurrency:
+  group: ridge-model-eval-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      ROBOFLOW_API_KEY: ${{ secrets.ROBOFLOW_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install inference runtime
+        run: |
+          python -m pip install -U pip
+          python -m pip install 'inference-models[onnx-cpu]' supervision opencv-python-headless
+
+      - name: Download external bare-field examples
+        run: |
+          mkdir -p farm_robot/test_images
+          curl -L --fail --retry 3 \
+            'https://commons.wikimedia.org/wiki/Special:Redirect/file/Furrows_J1.jpg?width=960' \
+            -o farm_robot/test_images/furrows_j1.jpg
+          curl -L --fail --retry 3 \
+            'https://commons.wikimedia.org/wiki/Special:Redirect/file/Ridges_and_furrows_-_geograph.org.uk_-_1267026.jpg' \
+            -o farm_robot/test_images/ridges_furrows.jpg
+
+      - name: Evaluate pretrained Plant Ridge/Furrow model
+        working-directory: farm_robot
+        run: |
+          python tools/eval_public_ridge_model.py \
+            test_images/furrows_j1.jpg \
+            test_images/ridges_furrows.jpg \
+            --model-id plant-jytyh/1 \
+            --confidence 0.15 \
+            --output artifacts/ridge_model_eval
+
+      - name: Upload evaluation outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pretrained-ridge-model-eval
+          path: farm_robot/artifacts/ridge_model_eval/
+          if-no-files-found: warn
+          retention-days: 7
