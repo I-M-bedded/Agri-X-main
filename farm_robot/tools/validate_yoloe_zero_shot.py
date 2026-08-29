@@ -7,6 +7,13 @@ Intended for workstation / CI validation before Raspberry Pi deployment.
 import argparse
 import json
 from pathlib import Path
+import sys
+
+# tools/ scripts are executed with farm_robot/tools as sys.path[0]. Add the
+# project root so the same imports work from CI, a workstation, and the Pi.
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import cv2
 import numpy as np
