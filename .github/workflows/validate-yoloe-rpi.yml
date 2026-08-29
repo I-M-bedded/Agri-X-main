@@ -8,6 +8,13 @@ on:
       - 'farm_robot/tools/validate_yoloe_zero_shot.py'
       - 'farm_robot/tools/export_yoloe_rpi.py'
       - 'farm_robot/sensors/ai_perception.py'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/validate-yoloe-rpi.yml'
+      - 'farm_robot/tools/validate_yoloe_zero_shot.py'
+      - 'farm_robot/tools/export_yoloe_rpi.py'
+      - 'farm_robot/sensors/ai_perception.py'
   workflow_dispatch:
 
 jobs:
