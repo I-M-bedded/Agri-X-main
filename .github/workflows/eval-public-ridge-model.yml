@@ -6,6 +6,11 @@ on:
     paths:
       - '.github/workflows/eval-public-ridge-model.yml'
       - 'farm_robot/tools/eval_public_ridge_model.py'
+  pull_request:
+    branches: [feature/aruco-align-bringup]
+    paths:
+      - '.github/workflows/eval-public-ridge-model.yml'
+      - 'farm_robot/tools/eval_public_ridge_model.py'
   workflow_dispatch:
 
 concurrency:
