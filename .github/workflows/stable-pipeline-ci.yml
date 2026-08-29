@@ -1,0 +1,48 @@
+name: stable-pipeline-ci
+
+on:
+  push:
+    branches: [integration/stable-pipeline, main]
+    paths:
+      - 'farm_robot/aruco_entry_bringup.py'
+      - 'farm_robot/control/furrow_ai_controller.py'
+      - 'farm_robot/navigation/agri_pipeline_fsm.py'
+      - 'farm_robot/navigation/aruco_entry_fsm.py'
+      - 'farm_robot/sensors/frame_aruco.py'
+      - 'farm_robot/sensors/perception_types.py'
+      - 'farm_robot/tools/pipeline_smoke_test.py'
+      - '.github/workflows/stable-pipeline-ci.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'farm_robot/aruco_entry_bringup.py'
+      - 'farm_robot/control/furrow_ai_controller.py'
+      - 'farm_robot/navigation/agri_pipeline_fsm.py'
+      - 'farm_robot/navigation/aruco_entry_fsm.py'
+      - 'farm_robot/sensors/frame_aruco.py'
+      - 'farm_robot/sensors/perception_types.py'
+      - 'farm_robot/tools/pipeline_smoke_test.py'
+      - '.github/workflows/stable-pipeline-ci.yml'
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Compile stable modules
+        working-directory: farm_robot
+        run: |
+          python -m py_compile \
+            aruco_entry_bringup.py \
+            control/furrow_ai_controller.py \
+            navigation/agri_pipeline_fsm.py \
+            navigation/aruco_entry_fsm.py \
+            sensors/frame_aruco.py \
+            sensors/perception_types.py \
+            tools/pipeline_smoke_test.py
+      - name: Run deterministic FSM smoke test
+        working-directory: farm_robot
+        run: python tools/pipeline_smoke_test.py
