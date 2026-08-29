@@ -1,6 +1,6 @@
 # Lightweight Agri-X mission pipeline
 
-This branch keeps the runtime intentionally non-ROS.  A Raspberry Pi 4 owns one
+This branch keeps the runtime intentionally non-ROS. A Raspberry Pi 4 owns one
 camera, two side ToF sensors, encoders, two motors and an optional pump; a single
 20 Hz FSM is easier to profile and recover than a multi-node runtime.
 
@@ -12,7 +12,7 @@ The new pipeline uses a deliberately simple installation contract.
 - `1..N`: furrow entrance markers in visiting order.
 - `249`: dedicated END marker placed on the headland after the final furrow.
 
-An entrance marker is a **turn waypoint**, not a full pose reference.  The robot
+An entrance marker is a **turn waypoint**, not a full pose reference. The robot
 centres the marker loosely, stops at a fixed stand-off distance, makes a coarse
 +/-90 degree encoder turn, and then hands residual lateral/heading error to the
 furrow follower.
@@ -25,9 +25,9 @@ This differs from the legacy `mission_state_machine.py` END-marker convention;
 ```text
 RPi Camera V2 (640x480 BGR)
         |
-        +---- ArUco, 10 Hz only in marker states
+        +---- ArUco, ~10 Hz only in marker states
         |
-        +---- latest-frame AI worker, ~2 Hz on Pi 4 target
+        +---- latest-frame AI worker, 2 Hz initial target on Pi 4
                   |
                   +---- furrow / farm-furrow / soil-trench masks
                   |        -> bottom-connected component
@@ -35,7 +35,7 @@ RPi Camera V2 (640x480 BGR)
                   |        -> geometric centre line
                   |        -> lateral + heading error
                   |
-                  +---- obstacle prompts
+                  +---- obstacle / non-traversable prompts
                            -> near-field trapezoid intersection
                            -> global SAFE_HALT
 
@@ -51,9 +51,11 @@ Encoders --------------------------------+
         +---- minimum travelled distance
 ```
 
-The AI worker never queues frames.  If inference is slower than the requested
-rate, old frames are dropped and only the newest image is processed.  The motor
-and ToF loop therefore keeps running at 20 Hz.
+The AI worker never queues frames. If inference is slower than the requested
+rate, old frames are dropped and only the newest image is processed. The motor
+and ToF loop therefore keeps running at 20 Hz. The control loop checks the latest
+AI safety snapshot on every tick; "always on" means the watchdog is continuously
+scheduled and enforced, not that a new CNN result is produced at 20 Hz.
 
 ## FSM
 
@@ -81,7 +83,7 @@ missing expected marker, lost guidance, or timeout -> SAFE_HALT.
 
 ## Zero-shot model
 
-The current reference model is **YOLOE-26n-seg**.  Text prompts are baked into
+The current reference model is **YOLOE-26n-seg**. Text prompts are baked into
 an exported model once, so the Pi does not run/download the text encoder.
 Prompts are kept small because open-vocabulary class matching also costs CPU.
 
@@ -95,14 +97,21 @@ Safety prompts:
 
 ```text
 person, animal, vehicle, tractor, rock, log, box,
-farm equipment, hole, water puddle
+farm equipment, hole, water puddle, obstacle,
+untraversable ground
 ```
 
 Important: open-vocabulary segmentation is a first-stage watchdog, not a proof
-of general traversability.  An unknown obstacle that does not match these
-concepts can be missed.  After field videos are collected, a small local
-`traversable / non-traversable / furrow` model should replace or distil this
-watchdog if arbitrary terrain safety becomes a requirement.
+of general traversability. Object-like prompts are expected to be more reliable
+than broad terrain concepts such as `untraversable ground`. An unknown obstacle
+that does not match these concepts can be missed. After field videos are
+collected, a small local `traversable / non-traversable / furrow` model should
+replace or distil this watchdog if arbitrary terrain safety becomes a requirement.
+
+Inside a furrow, the selected furrow mask itself also defines the desired drive
+corridor: the controller stays near its geometric centre and side ToF prevents
+contact with the ridges. The zero-shot safety branch is an additional front-area
+watchdog rather than the sole navigation signal.
 
 ## Raspberry Pi 4 deployment
 
@@ -122,15 +131,34 @@ farm_robot/models/agri_yoloe26n_ncnn_model
 Then on the Pi:
 
 ```bash
-python3 pipeline_main.py \
+python3 main.py \
   --model models/agri_yoloe26n_ncnn_model \
   --imgsz 320 \
   --inference-hz 2
 ```
 
-Start at `320x320`, 2 Hz AI, `0.28` maximum furrow speed.  Measure actual
-`snapshot.inference_sec` before increasing inference rate or speed.  ArUco and
-the 20 Hz controller remain separate from the AI worker.
+Start at `320x320`, 2 Hz AI, `0.28` maximum furrow speed. These are conservative
+**initial targets, not measured Pi 4 performance claims**. Read
+`snapshot.inference_sec`/logs on the actual Pi before increasing inference rate
+or speed. ArUco and the 20 Hz controller remain separate from the AI worker.
+
+The previous mission implementation is preserved as:
+
+```bash
+python3 main.py --legacy
+```
+
+## Cheap verification before ROS
+
+A deterministic dependency-injected smoke test checks the intended one-furrow
+mission sequence without GPIO or physics:
+
+```bash
+python3 tools/pipeline_smoke_test.py
+```
+
+It is only a state-machine regression test. It does not validate vehicle dynamics,
+camera geometry, ToF physics, or zero-shot perception accuracy.
 
 ## Why ROS is not in the runtime yet
 
@@ -148,9 +176,9 @@ Good Gazebo targets:
 Poor Gazebo target:
 
 - deciding whether zero-shot segmentation will work on real soil, shadows,
-  water, dust and exposure.  Use recorded real RPi Camera V2 video for that.
+  water, dust and exposure. Use recorded real RPi Camera V2 video for that.
 
 The new FSM uses dependency injection (`camera`, `tof`, `odom`, `motors`,
 `perception`), so ROS adapters can later implement those interfaces without
-rewriting mission logic.  Keep ROS as a simulation/adapter layer unless the
+rewriting mission logic. Keep ROS as a simulation/adapter layer unless the
 sensor stack grows enough to justify a distributed runtime.
