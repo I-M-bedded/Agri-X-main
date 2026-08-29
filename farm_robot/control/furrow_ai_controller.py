@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Closed-loop furrow controller for the zero-shot segmentation pipeline."""
+"""Closed-loop furrow controller using backend-neutral vision geometry."""
 
 from dataclasses import dataclass
 
@@ -19,7 +19,7 @@ from config import (
     VISION_MIN_CONFIDENCE,
 )
 from control.pid_controller import PIDController
-from sensors.ai_perception import FurrowEstimate
+from sensors.perception_types import FurrowEstimate
 from sensors.odometry import normalize_angle
 
 
@@ -33,7 +33,12 @@ class FurrowControlResult:
 
 
 class AIFurrowController:
-    """Combine segmented centre line, side ToF and encoder heading hold."""
+    """Combine corridor geometry, side ToF and encoder heading hold.
+
+    The controller is intentionally independent of the network that produced the
+    :class:`FurrowEstimate`; SegFormer, YOLO segmentation, or another backend can
+    be swapped without changing control logic.
+    """
 
     def __init__(self, tof_pair, odometry=None):
         self.tof = tof_pair
