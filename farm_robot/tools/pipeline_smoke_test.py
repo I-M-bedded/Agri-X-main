@@ -16,10 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import numpy as np
-
 from navigation.agri_pipeline_fsm import AgriPipelineFSM, PipelineConfig, PipelineState
-from sensors.ai_perception import FurrowEstimate, PerceptionSnapshot
+from sensors.perception_types import FurrowEstimate, PerceptionSnapshot
 
 
 @dataclass
@@ -33,7 +31,7 @@ class Obs:
 
 class FakeCamera:
     def capture_frame(self):
-        return np.zeros((480, 640, 3), dtype=np.uint8)
+        return object()
 
 
 class FakePerception:
