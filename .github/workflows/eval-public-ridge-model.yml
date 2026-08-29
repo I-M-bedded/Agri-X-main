@@ -20,7 +20,7 @@ concurrency:
 jobs:
   evaluate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 12
     env:
       ROBOFLOW_API_KEY: ${{ secrets.ROBOFLOW_API_KEY }}
     steps:
@@ -30,10 +30,10 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install inference runtime
+      - name: Install hosted inference client
         run: |
           python -m pip install -U pip
-          python -m pip install 'inference-models[onnx-cpu]' supervision opencv-python-headless
+          python -m pip install inference-sdk opencv-python-headless numpy
 
       - name: Download external bare-field examples
         run: |
@@ -52,7 +52,6 @@ jobs:
             test_images/furrows_j1.jpg \
             test_images/ridges_furrows.jpg \
             --model-id plant-jytyh/1 \
-            --confidence 0.15 \
             --output artifacts/ridge_model_eval
 
       - name: Upload evaluation outputs
