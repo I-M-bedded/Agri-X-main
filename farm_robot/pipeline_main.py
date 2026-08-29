@@ -2,7 +2,7 @@
 """Entrypoint for the lightweight non-ROS agricultural mission pipeline.
 
 Recommended Pi 4 deployment:
-    python3 tools/export_yoloe_rpi.py --output-hint models/
+    python3 tools/export_yoloe_rpi.py --output models/agri_yoloe26n_ncnn_model
     python3 pipeline_main.py --model models/agri_yoloe26n_ncnn_model
 
 For workstation testing, the public checkpoint may be used directly:
@@ -17,7 +17,7 @@ from actuators.motor_driver import MotorDriver
 from actuators.pump_controller import PumpController
 from config import TOF_LEFT, TOF_RIGHT
 from control.furrow_ai_controller import AIFurrowController
-from navigation.agri_pipeline_fsm import AgriPipelineFSM, PipelineConfig, PipelineState
+from navigation.agri_pipeline_fsm import AgriPipelineFSM, PipelineConfig
 from sensors.ai_perception import ZeroShotFieldPerception
 from sensors.camera import Camera
 from sensors.frame_aruco import FrameArucoDetector
