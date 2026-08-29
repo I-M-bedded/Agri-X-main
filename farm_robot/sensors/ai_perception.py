@@ -37,8 +37,10 @@ FURROW_PROMPTS = (
     "soil trench",
 )
 
-# Keep this list deliberately short.  YOLOE compares region features with every
+# Keep this list deliberately short. YOLOE compares region features with every
 # prompt on every inference, so a large vocabulary directly increases latency.
+# Object-like prompts are generally more reliable; the last two broad terrain
+# prompts are exploratory and must be validated on real field recordings.
 OBSTACLE_PROMPTS = (
     "person",
     "animal",
@@ -50,6 +52,8 @@ OBSTACLE_PROMPTS = (
     "farm equipment",
     "hole",
     "water puddle",
+    "obstacle",
+    "untraversable ground",
 )
 
 PROMPT_CLASSES = FURROW_PROMPTS + OBSTACLE_PROMPTS
@@ -146,8 +150,10 @@ class ZeroShotFieldPerception:
         """Submit the newest BGR frame; any older pending frame is discarded."""
         if not self.ready or frame is None:
             return
+        # Camera.capture_frame() hands us a fresh ndarray that is not mutated by
+        # the main loop, so retaining the reference avoids a ~0.9 MB copy at 20 Hz.
         with self._lock:
-            self._latest_frame = frame.copy()
+            self._latest_frame = frame
         self._wake.set()
 
     def snapshot(self) -> Optional[PerceptionSnapshot]:
@@ -199,7 +205,9 @@ class ZeroShotFieldPerception:
                 self.last_error = str(exc)
                 log.warning("zero-shot inference failed: %s", exc)
 
-            next_allowed = time.monotonic() + min_period
+            # If inference itself takes longer than the requested period, run the
+            # next frame immediately. Do not add another full period afterwards.
+            next_allowed = start + min_period
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -309,7 +317,7 @@ class ZeroShotFieldPerception:
         for band_idx in range(band_count):
             b0 = int(roi_h * band_idx / band_count)
             b1 = int(roi_h * (band_idx + 1) / band_count)
-            ys, xs = np.nonzero(roi[b0:b1, :])
+            _, xs = np.nonzero(roi[b0:b1, :])
             if xs.size < max(20, int((b1 - b0) * w * 0.01)):
                 continue
             # Midpoint of both boundaries is more stable than the pixel centroid
