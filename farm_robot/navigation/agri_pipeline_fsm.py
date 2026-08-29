@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Lightweight marker -> furrow round-trip -> next marker -> home mission FSM.
 
-This is intentionally independent of ROS.  The hardware stack is small enough
+This is intentionally independent of ROS. The hardware stack is small enough
 that a single deterministic 20 Hz state machine is easier to debug on a Pi 4.
 The perception model runs in its own latest-frame worker, so slow AI inference
 never blocks motor/ToF safety ticks.
@@ -11,7 +11,7 @@ New field convention used by this pipeline:
   * marker 1..N: furrow entry waypoints in travel order
   * marker FIELD_END_MARKER_ID: dedicated END marker after the last furrow
 
-Each entry marker defines a fixed stop waypoint.  The robot stops at a constant
+Each entry marker defines a fixed stop waypoint. The robot stops at a constant
 stand-off distance, turns +/-90 degrees, then lets segmented furrow geometry and
 side ToF absorb residual alignment error.
 """
@@ -24,9 +24,10 @@ import time
 from config import (
     CONTROL_LOOP_DT,
     FIELD_END_MARKER_ID,
+    FIELD_END_MARKER_MAX_BEARING_RAD,
+    FIELD_END_MARKER_MAX_DISTANCE_M,
     HOME_MARKER_ID,
     PUMP_ON_RETURN_LEG,
-    TOF_NOMINAL_WALL_DISTANCE_MM,
 )
 from logutil import get_logger
 from navigation.furrow_manager import FurrowManager
@@ -76,7 +77,7 @@ class PipelineConfig:
     marker_scan_every_n_ticks: int = 2          # 10Hz at a 20Hz control loop
     marker_cache_sec: float = 0.20
     marker_lost_sec: float = 0.8
-    marker_search_timeout_sec: float = 45.0
+    marker_search_timeout_sec: float = 60.0
     marker_approach_timeout_sec: float = 20.0
 
     furrow_min_confidence: float = 0.25
@@ -158,6 +159,7 @@ class AgriPipelineFSM:
         self._last_target_seen = 0.0
         self._headland_heading = self.odom.theta
         self._home_heading = self.odom.theta
+        self._exit_heading = self.odom.theta
         self._leg_start_path = self.odom.path_length
         self._acquire_start_path = self.odom.path_length
         self._exit_start_path = self.odom.path_length
@@ -223,7 +225,11 @@ class AgriPipelineFSM:
                 if done_state == PipelineState.MISSION_COMPLETE:
                     self._goto(PipelineState.RETURN_HOME)
                 else:
-                    self._goto(PipelineState.SEARCH_NEXT_MARKER if self.manager.current_index else PipelineState.SEARCH_MARKER)
+                    self._goto(
+                        PipelineState.SEARCH_NEXT_MARKER
+                        if self.manager.current_index
+                        else PipelineState.SEARCH_MARKER
+                    )
             return
 
         self._last_target_seen = time.monotonic()
@@ -273,7 +279,11 @@ class AgriPipelineFSM:
 
     def _step_turn(self):
         progress = self.odom.theta - self._turn_start_theta
-        reached = progress >= self._turn_delta if self._turn_delta > 0 else progress <= self._turn_delta
+        reached = (
+            progress >= self._turn_delta
+            if self._turn_delta > 0
+            else progress <= self._turn_delta
+        )
         if reached:
             self.motors.stop()
             self._complete_turn(self._turn_next)
@@ -340,11 +350,24 @@ class AgriPipelineFSM:
         return True
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _end_marker_is_close(obs):
+        if obs is None:
+            return False
+        bearing = abs(math.atan2(obs.lateral_offset_m, max(0.05, obs.forward_m)))
+        return (
+            obs.distance_m <= FIELD_END_MARKER_MAX_DISTANCE_M
+            and bearing <= FIELD_END_MARKER_MAX_BEARING_RAD
+        )
+
     def _search_next(self, markers):
         target_id = self.manager.next_marker_id()
         end_obs = markers.get(FIELD_END_MARKER_ID)
-        if end_obs is not None:
-            log.info("END marker observed after %d completed furrows", self.manager.total_completed())
+        if self._end_marker_is_close(end_obs):
+            log.info(
+                "END marker observed after %d completed furrows",
+                self.manager.total_completed(),
+            )
             self._begin_turn(
                 PipelineState.RETURN_HOME_TURN,
                 math.pi,
@@ -384,6 +407,7 @@ class AgriPipelineFSM:
                 self.pump.turn_off()
             if returning:
                 self._exit_start_path = self.odom.path_length
+                self._exit_heading = self.odom.theta
                 if self.pump is not None:
                     self.pump.set_zone(False)
                 self._goto(PipelineState.EXIT_FURROW)
@@ -441,7 +465,7 @@ class AgriPipelineFSM:
         markers = self._markers(frame)
 
         # INIT waits without moving until the asynchronous safety model has
-        # produced its first snapshot.  After that, stale perception is fail-safe.
+        # produced its first snapshot. After that, stale perception is fail-safe.
         if self.state == PipelineState.INIT:
             self.motors.stop()
             if self.cfg.require_ai_safety:
@@ -465,7 +489,11 @@ class AgriPipelineFSM:
 
         if self.state == PipelineState.APPROACH_MARKER:
             obs = markers.get(self.manager.next_marker_id())
-            self._approach_observation(obs, self.cfg.marker_stop_distance_m, PipelineState.ACQUIRE_FURROW)
+            self._approach_observation(
+                obs,
+                self.cfg.marker_stop_distance_m,
+                PipelineState.ACQUIRE_FURROW,
+            )
             return
 
         if self.state in (
@@ -480,7 +508,10 @@ class AgriPipelineFSM:
         if self.state == PipelineState.ACQUIRE_FURROW:
             snap = self.perception.snapshot()
             furrow = snap.furrow if snap is not None else None
-            vision_ok = furrow is not None and furrow.confidence >= self.cfg.furrow_min_confidence
+            vision_ok = (
+                furrow is not None
+                and furrow.confidence >= self.cfg.furrow_min_confidence
+            )
             tof_ok = self.tof.walls_visible()
             if vision_ok or tof_ok:
                 self.furrow_controller.reset()
@@ -490,7 +521,10 @@ class AgriPipelineFSM:
                 return
 
             creep = self.odom.path_length - self._acquire_start_path
-            if creep > self.cfg.furrow_acquire_creep_m or self._elapsed() > self.cfg.furrow_acquire_timeout_sec:
+            if (
+                creep > self.cfg.furrow_acquire_creep_m
+                or self._elapsed() > self.cfg.furrow_acquire_timeout_sec
+            ):
                 self._halt("furrow could not be acquired after entry turn")
                 return
 
@@ -521,8 +555,7 @@ class AgriPipelineFSM:
             if self._elapsed() > self.cfg.exit_timeout_sec:
                 self._halt("furrow exit timeout")
                 return
-            # Preserve the return heading while clearing the entrance.
-            self._heading_hold(self.cfg.exit_speed, self.odom.theta)
+            self._heading_hold(self.cfg.exit_speed, self._exit_heading)
             return
 
         if self.state == PipelineState.RETURN_HOME:
@@ -540,13 +573,20 @@ class AgriPipelineFSM:
 
         if self.state == PipelineState.HOME_APPROACH:
             home = markers.get(HOME_MARKER_ID)
-            self._approach_observation(home, self.cfg.home_stop_distance_m, PipelineState.MISSION_COMPLETE)
+            self._approach_observation(
+                home,
+                self.cfg.home_stop_distance_m,
+                PipelineState.MISSION_COMPLETE,
+            )
             return
 
     # ------------------------------------------------------------------
     def run_forever(self):
         try:
-            while self.state not in (PipelineState.MISSION_COMPLETE, PipelineState.SAFE_HALT):
+            while self.state not in (
+                PipelineState.MISSION_COMPLETE,
+                PipelineState.SAFE_HALT,
+            ):
                 start = time.monotonic()
                 self.step()
                 remain = self.cfg.loop_dt_sec - (time.monotonic() - start)
