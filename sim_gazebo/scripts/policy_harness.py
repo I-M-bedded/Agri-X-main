@@ -153,6 +153,7 @@ class PolicyHarness:
             "entry_ok": False, "max_dev_cm": 0.0, "ridge_hit_ticks": 0,
             "uturn_ok": False, "returned_ok": False,
             "home_err_cm": None, "drive_len_m": 0.0,
+            "drive_len_out": 0.0, "drive_len_back": 0.0,
             "vision_used": 0, "vision_vetoed": 0, "tof_only": 0,
             "fail": "",
         }
@@ -475,7 +476,7 @@ class PolicyHarness:
         return mx + off * lx - 0.7 * fx, my + off * ly - 0.7 * fy
 
     # ------------------------------------------------ 상태 2: 진입
-    def do_enter(self, timeout=150.0):
+    def do_enter(self, timeout=150.0, adv_limit=1.6):
         """밭 방향으로 서서 전진. 좌우 벽이 연속으로 잡히면 진입 성공."""
         self.turn_to(self.field_th)
         t0 = time.time()
@@ -486,7 +487,7 @@ class PolicyHarness:
             self.scan_tick()
             if self.walls_seen():
                 good += 1
-                if good >= 4:
+                if good >= 8:      # 입구에서 벽이 깜빡이므로 넉넉히 확인
                     self.step(0.0, 0.0)
                     return True
             else:
@@ -496,7 +497,7 @@ class PolicyHarness:
             # [수정] 예전 0.9m 는 너무 짧았다. 진입점이 팻말 0.7m 앞이고
             #   오도메트리가 회전 미끄러짐으로 20~25% 과대보고하기 때문에
             #   실제로는 밭 경계 4cm 앞에서 포기했다(실측).
-            if adv > 1.6:                          # 1.6m 갔는데 벽이 없다
+            if adv > adv_limit:                    # 이만큼 갔는데 벽이 없다
                 if self.a.entry != "tof" or probes >= 5:
                     self.r["fail"] = "no_walls"
                     self.step(0.0, 0.0)
@@ -536,25 +537,50 @@ class PolicyHarness:
         return False
 
     # ------------------------------------------------ 상태 3: 고랑 주행
-    def do_furrow(self, timeout=45.0, speed=0.22, kp=1.6):
+    def do_furrow(self, timeout=45.0, speed=0.22, kp=1.2, kd=0.45):
         """고랑 끝까지 주행. 좌우 벽이 연속으로 사라지면 끝으로 판정."""
         t0 = time.time()
         lost = 0
+        prev = None
         p0 = (self.od[0], self.od[1])
         while time.time() - t0 < timeout:
             self.scan_tick()
+            travelled = math.hypot(self.od[0] - p0[0], self.od[1] - p0[1])
             if not self.walls_seen():
                 lost += 1
-                if lost >= 12:                   # 0.6초 연속 -> 고랑 끝
+                # [수정] 예전에는 0.6초만 벽이 없으면 '고랑 끝'으로 판정했다.
+                #   입구 바로 안쪽에서는 ToF 가 깜빡이기 때문에 진입하자마자
+                #   끝났다고 착각해 0.12m 만에 유턴했다(실측 6/6).
+                #   1.5초 연속 + 최소 1.5m 주행을 모두 만족해야 끝으로 본다.
+                # 3초(60틱) 연속 + 최소 1.5m. 1.5초로는 고랑 중간의 일시적인
+                # ToF 드롭아웃을 끝으로 오판했다(실측 2/6이 1.50m 에서 멈춤).
+                if lost >= 60 and travelled > 1.5:
                     self.step(0.0, 0.0)
-                    self.r["drive_len_m"] = round(
-                        math.hypot(self.od[0] - p0[0], self.od[1] - p0[1]), 2)
+                    self.r["drive_len_m"] = round(travelled, 2)
                     return True
+                if self.a.debug and self.r["ticks"] % 20 == 0:
+                    self._dbg(f"  furrow(벽없음) d={travelled:.2f} lost={lost} "
+                              f"truth=({self.truth[0]:.2f},{self.truth[1]:.2f},"
+                              f"{math.degrees(self.truth[2]):.0f}) "
+                              f"tof=({self.tof_l:.2f},{self.tof_r:.2f})")
                 self.step(speed, 0.0)            # 벽이 잠깐 없으면 직진 유지
                 continue
             lost = 0
-            ang = max(-0.8, min(0.8, -kp * self.fuse()))
+            # [수정] 비례항만 쓰면 '횡오차 -> 조향각속도' 가 2중 적분이라
+            #   반드시 진동한다. 실제로 좌우로 흔들리다 ±9~10cm 에서 ToF 가
+            #   벽에 닿아(최소거리 2cm 미만) inf 를 뱉고, 그걸 '고랑 끝'으로
+            #   오판했다(비전 유무와 무관하게 6m 중 1.5~4.6m 만 주행).
+            #   미분항으로 감쇠를 준다.
+            err = self.fuse()
+            d = 0.0 if prev is None else (err - prev) / DT
+            prev = err
+            ang = max(-0.8, min(0.8, -(kp * err + kd * d)))
             self.step(speed, ang)
+            if self.a.debug and self.r["ticks"] % 20 == 0:
+                self._dbg(f"  furrow d={travelled:.2f} lost={lost} "
+                          f"truth=({self.truth[0]:.2f},{self.truth[1]:.2f},"
+                          f"{math.degrees(self.truth[2]):.0f}) "
+                          f"tof=({self.tof_l:.2f},{self.tof_r:.2f})")
         self.r["drive_len_m"] = round(
             math.hypot(self.od[0] - p0[0], self.od[1] - p0[1]), 2)
         self.r["fail"] = self.r["fail"] or "furrow_timeout"
@@ -598,8 +624,22 @@ class PolicyHarness:
 
         # --- stage=full: 고랑 끝 -> 유턴 -> 복귀 ---
         self.do_furrow()
-        self.r["uturn_ok"] = self.turn_to(wrap(self.od[2] + math.pi), timeout=14)
-        self.r["returned_ok"] = bool(self.do_furrow(timeout=45.0))
+        self.r["drive_len_out"] = self.r["drive_len_m"]
+
+        # 유턴: 밭 방위도 함께 뒤집는다(복귀 구간의 헤딩 유지 기준이 된다)
+        self.r["uturn_ok"] = self.turn_to(wrap(self.od[2] + math.pi), timeout=16)
+        self.field_th = wrap(self.field_th + math.pi)
+
+        # [수정] 유턴 직후에는 고랑 **밖**(끝을 지나친 지점)에 서 있다.
+        #   바로 do_furrow 를 부르면 벽이 없어 곧장 '고랑 끝'으로 오판하고
+        #   최소 주행거리 1.5m 만 달리고 끝났다(실측 6/6 모두 1.50m).
+        #   먼저 고랑에 다시 들어간 뒤 추종을 시작한다.
+        # 고랑 끝 판정 후 3초를 더 달렸으므로 1m 남짓 지나쳐 있다.
+        # 재진입 예산을 넉넉히 준다.
+        reacq = self.do_enter(timeout=60.0, adv_limit=2.8)
+        self.r["reacquired"] = bool(reacq)
+        self.r["returned_ok"] = bool(reacq and self.do_furrow(timeout=60.0))
+        self.r["drive_len_back"] = self.r["drive_len_m"]
         if self.truth is not None and t_start is not None:
             self.r["home_err_cm"] = round(math.hypot(
                 self.truth[0] - t_start[0], self.truth[1] - t_start[1]) * 100, 1)

@@ -68,6 +68,8 @@ def main():
                             "back:survey,rotate:tof,sweep:tof,creep:tof,back:tof")
     ap.add_argument("--starts", default="all",
                     help="all 또는 인덱스 목록(예: 0,2,4)")
+    ap.add_argument("--vision", default="measured",
+                    choices=["measured", "blind"])
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -92,7 +94,8 @@ def main():
                        "--marker-cm", str(args.marker_cm),
                        "--tilt", str(args.tilt),
                        "--start-x", str(sx), "--start-y", str(sy),
-                       "--start-yaw", str(syaw), "--seed", str(args.seed)]
+                       "--start-yaw", str(syaw), "--seed", str(args.seed),
+                       "--vision", args.vision]
                 t0 = time.time()
                 try:
                     out = subprocess.run(cmd, capture_output=True, text=True,
