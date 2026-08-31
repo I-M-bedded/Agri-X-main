@@ -1,27 +1,19 @@
 #!/usr/bin/env python3
-"""Interactive Raspberry Pi WASD jog controller for the Mega motion firmware.
+"""Interactive WASD bring-up through the production MegaMotion abstraction.
 
-This bring-up tool talks to the same USB serial interface as Arduino Serial
-Monitor, but uses the firmware's target-speed command instead of fixed raw WASD
-speed:
+Unlike the Mega firmware's raw single-byte WASD test, this tool uses the same
+``MegaMotion`` transport/protocol layer as autonomous driving and sends explicit
+physical wheel-speed targets with ``DRIVE left_rpm right_rpm``.
 
-    DRIVE <left_rpm> <right_rpm>
-
-The default straight-line target is deliberately moderate (40 RPM): high enough
-to avoid the sluggish 20 RPM bring-up setting, while remaining well below the
-80 RPM raw-manual command used by the firmware's single-byte WASD interface.
-In-place turns use 80% of the straight target to reduce track scrub/current.
-
-The active DRIVE command is refreshed every 100 ms. If terminal key-repeat
-stops, this tool sends STOP after the dead-man interval; the Mega's independent
-400 ms DRIVE watchdog remains the final safety layer if the Pi process or USB
-link stalls.
+Terminal input does not provide key-up events. A held key is therefore inferred
+from OS key-repeat events. The first key press starts at a moderate RPM; repeated
+same-direction events increase the target linearly toward the configured maximum.
+The target never ramps by itself after key repeats stop.
 """
 
 from __future__ import annotations
 
 import argparse
-import glob
 from pathlib import Path
 import select
 import sys
@@ -33,72 +25,37 @@ _FARM_ROBOT = str(Path(__file__).resolve().parents[1])
 if _FARM_ROBOT not in sys.path:
     sys.path.insert(0, _FARM_ROBOT)
 
-from config import (  # noqa: E402
-    SERIAL_MEGA_BAUD,
-    SERIAL_MEGA_PORT,
-    SERIAL_MEGA_RESET_DELAY_SEC,
-)
+from control.mega_motion import MegaMotion  # noqa: E402
 
 
 REFRESH_SEC = 0.10
-DEFAULT_RPM = 40.0
-DEFAULT_TURN_SCALE = 0.80
-DEFAULT_DEADMAN_SEC = 0.55
-RPM_STEP = 5.0
-MIN_RPM = 10.0
-MAX_RPM = 80.0
+DEFAULT_START_RPM = 60.0
+DEFAULT_MAX_RPM = 120.0
+DEFAULT_RAMP_SEC = 1.20
+DEFAULT_TURN_SCALE = 0.85
+INITIAL_REPEAT_GRACE_SEC = 0.70
+RELEASE_DEADMAN_SEC = 0.25
+MAX_TEST_RPM = 145.0  # firmware clamps at 150 RPM; retain a little margin
+RPM_STEP = 10.0
 
 
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, float(value)))
 
 
-def find_serial_port() -> str:
-    """Find a likely Arduino/USB-serial device on Raspberry Pi."""
-    patterns = (
-        "/dev/serial/by-id/*Mega*",
-        "/dev/serial/by-id/*Arduino*",
-        "/dev/serial/by-id/*CH340*",
-        "/dev/serial/by-id/*CH341*",
-    )
-    by_id: list[str] = []
-    for pattern in patterns:
-        by_id.extend(glob.glob(pattern))
-    if by_id:
-        return sorted(set(by_id))[0]
-
-    candidates = sorted(glob.glob("/dev/ttyACM*")) + sorted(glob.glob("/dev/ttyUSB*"))
-    if candidates:
-        return candidates[0]
-    raise RuntimeError("Mega serial port not found (/dev/ttyACM* or /dev/ttyUSB*)")
+def ramp_rpm(start_rpm: float, max_rpm: float, held_sec: float, ramp_sec: float) -> float:
+    if ramp_sec <= 0.0:
+        return max_rpm
+    alpha = clamp(held_sec / ramp_sec, 0.0, 1.0)
+    return start_rpm + alpha * (max_rpm - start_rpm)
 
 
-def print_help(rpm: float, turn_scale: float) -> None:
-    print(
-        "\nControls: W forward | S reverse | A left | D right | "
-        "X/Space stop | P state | +/- speed | Q quit"
-    )
-    print(
-        f"Straight={rpm:.0f} RPM, turn={rpm * turn_scale:.0f} RPM. "
-        f"+/- changes straight target by {RPM_STEP:.0f} RPM.\n"
-    )
-
-
-def write_line(ser, line: str) -> None:
-    ser.write((line + "\n").encode("ascii"))
-    ser.flush()
-
-
-def send_stop(ser) -> None:
-    write_line(ser, "STOP")
-
-
-def command_for_key(key: str, rpm: float, turn_scale: float) -> tuple[float, float]:
-    turn_rpm = rpm * turn_scale
+def wheel_targets(key: str, rpm: float, turn_scale: float) -> tuple[float, float]:
     if key == "w":
         return rpm, rpm
     if key == "s":
         return -rpm, -rpm
+    turn_rpm = rpm * turn_scale
     if key == "a":
         return -turn_rpm, turn_rpm
     if key == "d":
@@ -106,82 +63,60 @@ def command_for_key(key: str, rpm: float, turn_scale: float) -> tuple[float, flo
     raise ValueError(f"unsupported motion key: {key}")
 
 
-def send_drive(ser, key: str, rpm: float, turn_scale: float) -> tuple[float, float]:
-    left, right = command_for_key(key, rpm, turn_scale)
-    write_line(ser, f"DRIVE {left:.3f} {right:.3f}")
-    return left, right
+def print_help(start_rpm: float, max_rpm: float, ramp_sec: float, turn_scale: float) -> None:
+    print(
+        "\nControls: W forward | S reverse | A left | D right | "
+        "X/Space stop | P state | +/- max RPM | Q quit"
+    )
+    print(
+        f"Hold/repeat: {start_rpm:.0f} -> {max_rpm:.0f} RPM over {ramp_sec:.1f}s; "
+        f"turn scale={turn_scale:.2f}."
+    )
+    print(
+        f"First-repeat grace={INITIAL_REPEAT_GRACE_SEC:.2f}s, "
+        f"release stop={RELEASE_DEADMAN_SEC:.2f}s after repeats begin.\n"
+    )
 
 
-def drain_lines(ser, rx_buffer: bytearray) -> list[str]:
-    waiting = int(getattr(ser, "in_waiting", 0))
-    if waiting > 0:
-        rx_buffer.extend(ser.read(waiting))
-
-    lines: list[str] = []
-    while b"\n" in rx_buffer:
-        raw, _, rest = rx_buffer.partition(b"\n")
-        rx_buffer[:] = rest
-        line = raw.decode("ascii", errors="replace").strip()
-        if line:
-            lines.append(line)
-    return lines
-
-
-def verify_link(ser, timeout: float = 1.0) -> tuple[bool, list[str], bytearray]:
-    """Request one STATE line and confirm Pi <-> Mega communication."""
-    rx_buffer = bytearray()
-    seen: list[str] = []
-
-    ser.reset_input_buffer()
-    write_line(ser, "STATUS")
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        for line in drain_lines(ser, rx_buffer):
-            seen.append(line)
-            if line.startswith("STATE "):
-                return True, seen, rx_buffer
-        time.sleep(0.01)
-    return False, seen, rx_buffer
+def print_state(motion: MegaMotion) -> None:
+    motion.request_status()
+    time.sleep(0.06)
+    state = motion.state
+    print(
+        f"\nSTATE mode={state.mode} "
+        f"L={state.left_rpm:+.1f}rpm R={state.right_rpm:+.1f}rpm "
+        f"Ldeg={state.left_degrees:+.1f} Rdeg={state.right_degrees:+.1f}"
+    )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Target-RPM WASD jog test for Raspberry Pi -> Agri-X Mega"
+        description="Ramped WASD test through the production MegaMotion abstraction"
     )
+    parser.add_argument("--port", help="Mega serial device; auto-detect when omitted")
     parser.add_argument(
-        "--port",
-        default=SERIAL_MEGA_PORT,
-        help="serial device, e.g. /dev/ttyACM0; auto-detected when omitted",
-    )
-    parser.add_argument(
-        "--baud",
-        type=int,
-        default=SERIAL_MEGA_BAUD,
-        help=f"serial baud rate (default: {SERIAL_MEGA_BAUD})",
-    )
-    parser.add_argument(
-        "--rpm",
+        "--start-rpm",
         type=float,
-        default=DEFAULT_RPM,
-        help=f"initial straight target RPM ({MIN_RPM:.0f}..{MAX_RPM:.0f}, default: {DEFAULT_RPM:.0f})",
+        default=DEFAULT_START_RPM,
+        help=f"RPM on first key press (default: {DEFAULT_START_RPM:.0f})",
+    )
+    parser.add_argument(
+        "--max-rpm",
+        type=float,
+        default=DEFAULT_MAX_RPM,
+        help=f"RPM after holding the key (default: {DEFAULT_MAX_RPM:.0f})",
+    )
+    parser.add_argument(
+        "--ramp-sec",
+        type=float,
+        default=DEFAULT_RAMP_SEC,
+        help=f"hold time to reach max RPM (default: {DEFAULT_RAMP_SEC:.1f}s)",
     )
     parser.add_argument(
         "--turn-scale",
         type=float,
         default=DEFAULT_TURN_SCALE,
-        help="in-place turn RPM / straight RPM (default: 0.80)",
-    )
-    parser.add_argument(
-        "--deadman",
-        type=float,
-        default=DEFAULT_DEADMAN_SEC,
-        help="seconds without a repeated motion key before STOP (default: 0.55)",
-    )
-    parser.add_argument(
-        "--reset-delay",
-        type=float,
-        default=SERIAL_MEGA_RESET_DELAY_SEC,
-        help="delay after opening serial because Mega may reset",
+        help=f"in-place turn RPM scale (default: {DEFAULT_TURN_SCALE:.2f})",
     )
     args = parser.parse_args()
 
@@ -189,142 +124,113 @@ def main() -> int:
         print("This controller must be run in an interactive terminal.", file=sys.stderr)
         return 2
 
-    try:
-        import serial
-    except ImportError:
-        print(
-            "pyserial is not installed. Run: sudo apt install python3-serial",
-            file=sys.stderr,
-        )
-        return 2
-
-    try:
-        device = args.port or find_serial_port()
-    except Exception as exc:
-        print(f"Serial device detection failed: {exc}", file=sys.stderr)
-        return 1
-
-    rpm = clamp(args.rpm, MIN_RPM, MAX_RPM)
+    max_rpm = clamp(args.max_rpm, 20.0, MAX_TEST_RPM)
+    start_rpm = clamp(args.start_rpm, 10.0, max_rpm)
+    ramp_sec = clamp(args.ramp_sec, 0.0, 5.0)
     turn_scale = clamp(args.turn_scale, 0.40, 1.00)
-    deadman = clamp(args.deadman, 0.35, 1.00)
 
-    try:
-        ser = serial.Serial(
-            device,
-            args.baud,
-            timeout=0,
-            write_timeout=1.0,
-            exclusive=True,
-        )
-    except TypeError:
-        # Older pyserial versions may not expose the Linux exclusive option.
-        ser = serial.Serial(device, args.baud, timeout=0, write_timeout=1.0)
-    except Exception as exc:
-        print(f"Cannot open {device}: {exc}", file=sys.stderr)
-        print("Check permissions and make sure no serial monitor owns the port.")
+    motion = MegaMotion(port=args.port or None)
+    if not motion.available or motion.faulted:
+        print(f"Mega Motion connection failed: {motion.last_error}", file=sys.stderr)
+        motion.cleanup()
         return 1
 
     fd = sys.stdin.fileno()
     old_term = termios.tcgetattr(fd)
 
+    active_key: str | None = None
+    held_since = 0.0
+    last_key_event = 0.0
+    current_rpm = start_rpm
+    next_refresh = 0.0
+    repeat_seen = False
+
     try:
-        print(f"Opened {device} @ {args.baud}.")
-        if args.reset_delay > 0:
-            print(f"Waiting {args.reset_delay:.1f}s for Mega reset/startup...")
-            time.sleep(args.reset_delay)
-
-        ok, startup_lines, rx_buffer = verify_link(ser)
-        for line in startup_lines:
-            if line.startswith("READY ") or line.startswith("ERR "):
-                print(f"Mega: {line}")
-
-        if not ok:
-            print("Mega did not return STATE after STATUS.", file=sys.stderr)
-            print(
-                "Try --port explicitly and verify that the working serial monitor "
-                "uses the same device and 115200 baud.",
-                file=sys.stderr,
-            )
-            return 1
-
-        print("Mega serial link verified (received STATE).")
-        print(f"refresh={REFRESH_SEC:.2f}s, deadman={deadman:.2f}s")
-        print_help(rpm, turn_scale)
-
-        active_key: str | None = None
-        command_deadline = 0.0
-        next_refresh = 0.0
-        show_next_state = False
-
+        print("MegaMotion abstraction connected.")
+        print(f"refresh={REFRESH_SEC:.2f}s; firmware DRIVE watchdog remains active")
+        print_help(start_rpm, max_rpm, ramp_sec, turn_scale)
         tty.setcbreak(fd)
 
         while True:
             now = time.monotonic()
-
             readable, _, _ = select.select([sys.stdin], [], [], 0.02)
+
             if readable:
                 key = sys.stdin.read(1).lower()
+                now = time.monotonic()
 
                 if key in "wasd":
+                    same_continuous_key = (
+                        active_key == key
+                        and last_key_event > 0.0
+                        and (now - last_key_event) <= INITIAL_REPEAT_GRACE_SEC
+                    )
+                    if same_continuous_key:
+                        repeat_seen = True
+                    else:
+                        active_key = key
+                        held_since = now
+                        repeat_seen = False
+                        current_rpm = start_rpm
+
                     active_key = key
-                    command_deadline = now + deadman
-                    left, right = send_drive(ser, active_key, rpm, turn_scale)
+                    last_key_event = now
+                    current_rpm = ramp_rpm(
+                        start_rpm,
+                        max_rpm,
+                        now - held_since,
+                        ramp_sec,
+                    )
+                    left, right = wheel_targets(active_key, current_rpm, turn_scale)
+                    if not motion.set_wheel_rpm(left, right):
+                        raise RuntimeError(motion.last_error or "failed to send DRIVE")
                     next_refresh = now + REFRESH_SEC
                     print(
-                        f"\rDRIVE L={left:+.0f} R={right:+.0f} RPM            ",
+                        f"\rDRIVE L={left:+.0f} R={right:+.0f} RPM "
+                        f"hold={now - held_since:.2f}s          ",
                         end="",
                         flush=True,
                     )
+
                 elif key in ("x", " "):
                     active_key = None
-                    command_deadline = 0.0
-                    send_stop(ser)
-                    print("\rSTOP                                      ", end="", flush=True)
+                    repeat_seen = False
+                    motion.stop()
+                    print("\rSTOP                                           ", end="", flush=True)
+
                 elif key == "p":
-                    show_next_state = True
-                    write_line(ser, "STATUS")
+                    print_state(motion)
+
                 elif key in ("+", "="):
-                    rpm = clamp(rpm + RPM_STEP, MIN_RPM, MAX_RPM)
-                    print(
-                        f"\rtarget={rpm:.0f} RPM, turn={rpm * turn_scale:.0f} RPM       ",
-                        end="",
-                        flush=True,
-                    )
+                    max_rpm = clamp(max_rpm + RPM_STEP, start_rpm, MAX_TEST_RPM)
+                    print(f"\nmax RPM={max_rpm:.0f}")
+
                 elif key in ("-", "_"):
-                    rpm = clamp(rpm - RPM_STEP, MIN_RPM, MAX_RPM)
-                    print(
-                        f"\rtarget={rpm:.0f} RPM, turn={rpm * turn_scale:.0f} RPM       ",
-                        end="",
-                        flush=True,
-                    )
+                    max_rpm = clamp(max_rpm - RPM_STEP, start_rpm, MAX_TEST_RPM)
+                    print(f"\nmax RPM={max_rpm:.0f}")
+
                 elif key == "q":
                     break
+
                 elif key == "h":
-                    print_help(rpm, turn_scale)
+                    print_help(start_rpm, max_rpm, ramp_sec, turn_scale)
 
             now = time.monotonic()
             if active_key is not None:
-                if now >= command_deadline:
+                timeout = RELEASE_DEADMAN_SEC if repeat_seen else INITIAL_REPEAT_GRACE_SEC
+                if (now - last_key_event) >= timeout:
                     active_key = None
-                    send_stop(ser)
-                    print("\rDEADMAN STOP                               ", end="", flush=True)
+                    repeat_seen = False
+                    motion.stop()
+                    print("\rDEADMAN STOP                                   ", end="", flush=True)
                 elif now >= next_refresh:
-                    left, right = send_drive(ser, active_key, rpm, turn_scale)
+                    left, right = wheel_targets(active_key, current_rpm, turn_scale)
+                    if not motion.set_wheel_rpm(left, right):
+                        raise RuntimeError(motion.last_error or "failed to refresh DRIVE")
                     next_refresh = now + REFRESH_SEC
-                    print(
-                        f"\rDRIVE L={left:+.0f} R={right:+.0f} RPM            ",
-                        end="",
-                        flush=True,
-                    )
 
-            for line in drain_lines(ser, rx_buffer):
-                if line.startswith("ERR "):
-                    print(f"\nMega: {line}", file=sys.stderr)
-                elif line == "STOPPED":
-                    print("\rMega: STOPPED                              ", end="", flush=True)
-                elif show_next_state and line.startswith("STATE "):
-                    print(f"\nMega: {line}")
-                    show_next_state = False
+            if motion.faulted:
+                raise RuntimeError(motion.last_error or "Mega Motion fault")
 
     except KeyboardInterrupt:
         pass
@@ -333,13 +239,9 @@ def main() -> int:
         return 1
     finally:
         try:
-            if ser.is_open:
-                try:
-                    send_stop(ser)
-                except Exception:
-                    pass
-                ser.close()
+            motion.stop()
         finally:
+            motion.cleanup()
             termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
         print("\nStopped.")
 
