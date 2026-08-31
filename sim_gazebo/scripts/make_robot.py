@@ -33,7 +33,11 @@ sys.path.insert(0, os.path.join(_ROOT, "farm_robot"))
 
 import config as C  # noqa: E402
 
-BODY_L, BODY_W = 0.30, 0.20
+# 차체: 길이 30cm x **폭 18cm**(실기 확정값).
+#   [주의] 이 보고서의 측정 수치는 전부 **폭 20cm** 로 얻은 것입니다.
+#   18cm 는 좌우 여유가 각 1cm 넓어지는 방향이므로 결과는 개선 쪽으로만
+#   움직입니다(reports/gazebo_policy_sweep.md 9절에 예상 영향 정리).
+BODY_L, BODY_W = 0.30, 0.18
 HULL_H = 0.18                 # 하부 헐 높이
 MAST_H = 0.30                 # 상부 마스트 높이 (헐 위)
 CLEARANCE = 0.02              # 지상고
@@ -164,7 +168,7 @@ def main():
 
     sdf = f'''<?xml version="1.0"?>
 <!-- 자동 생성: sim_gazebo/scripts/make_robot.py
-     전체 {BODY_L*100:.0f}x{BODY_W*100:.0f}x{(CLEARANCE+HULL_H+MAST_H)*100:.0f}cm
+     전체 {BODY_L*100:.0f}x{BODY_W*100:.0f}x{(CLEARANCE+HULL_H+MAST_H)*100:.0f}cm (폭 18cm 실기값)
      헐 {HULL_H*100:.0f}cm + 마스트 {MAST_H*100:.0f}cm, 카메라 {CAM_HEIGHT_M*100:.0f}cm
      ※ 탱크 궤도는 차동구동 근사. 회전 미끄러짐 수치는 신뢰하지 말 것. -->
 <sdf version="1.10">

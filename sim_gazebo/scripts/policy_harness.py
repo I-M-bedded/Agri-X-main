@@ -66,8 +66,8 @@ from gz.transport13 import Node
 # ---- 밭/로봇 상수 ----
 SPACING = 1.0
 FURROW_HALF = 0.20          # 고랑 반폭 (이랑 밑면 0.6 -> 틈 0.4m)
-BODY_HALF = 0.10
-MARGIN = FURROW_HALF - BODY_HALF     # 0.10m 넘으면 이랑 밟음
+BODY_HALF = 0.09            # 차체 폭 18cm (실기 확정). 측정 당시는 20cm 였다.
+MARGIN = FURROW_HALF - BODY_HALF     # 0.11m 넘으면 이랑 밟음 (20cm 였을 땐 0.10m)
 FIELD_LEN = 6.0
 TOF_MAX = 0.80
 CAM_W, CAM_H, HFOV = 640, 480, math.radians(62.0)

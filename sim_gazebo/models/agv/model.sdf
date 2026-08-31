@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <!-- 자동 생성: sim_gazebo/scripts/make_robot.py
-     전체 30x20x50cm
+     전체 30x18x50cm (폭 18cm 실기값)
      헐 18cm + 마스트 30cm, 카메라 45cm
      ※ 탱크 궤도는 차동구동 근사. 회전 미끄러짐 수치는 신뢰하지 말 것. -->
 <sdf version="1.10">
@@ -10,25 +10,25 @@
       <inertial>
         <pose>0 0 -0.02 0 0 0</pose>
         <mass>8.0</mass>
-        <inertia><ixx>0.0483</ixx><iyy>0.0816</iyy><izz>0.0867</izz>
+        <inertia><ixx>0.0432</ixx><iyy>0.0816</iyy><izz>0.0816</izz>
           <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia>
       </inertial>
       <collision name="col_hull">
         <pose>0.000 0.000 0.000 0 0 0</pose>
-        <geometry><box><size>0.300 0.200 0.180</size></box></geometry>
+        <geometry><box><size>0.300 0.180 0.180</size></box></geometry>
       </collision>
       <visual name="vis_hull">
         <pose>0.000 0.000 0.000 0 0 0</pose>
-        <geometry><box><size>0.300 0.200 0.180</size></box></geometry>
+        <geometry><box><size>0.300 0.180 0.180</size></box></geometry>
         <material><ambient>0.20 0.35 0.50 1</ambient><diffuse>0.20 0.35 0.50 1</diffuse></material>
       </visual>
       <visual name="vis_track_l">
-        <pose>0.000 0.115 -0.070 0 0 0</pose>
+        <pose>0.000 0.105 -0.070 0 0 0</pose>
         <geometry><box><size>0.300 0.030 0.080</size></box></geometry>
         <material><ambient>0.10 0.10 0.12 1</ambient><diffuse>0.10 0.10 0.12 1</diffuse></material>
       </visual>
       <visual name="vis_track_r">
-        <pose>0.000 -0.115 -0.070 0 0 0</pose>
+        <pose>0.000 -0.105 -0.070 0 0 0</pose>
         <geometry><box><size>0.300 0.030 0.080</size></box></geometry>
         <material><ambient>0.10 0.10 0.12 1</ambient><diffuse>0.10 0.10 0.12 1</diffuse></material>
       </visual>
@@ -67,7 +67,7 @@
       </sensor>
 
       <sensor name="tof_left" type="gpu_lidar">
-        <pose>0 0.130 -0.030 0 0 1.5708</pose>
+        <pose>0 0.120 -0.030 0 0 1.5708</pose>
         <update_rate>20</update_rate><topic>tof_left</topic>
         <lidar>
           <scan><horizontal><samples>1</samples>
@@ -79,7 +79,7 @@
       </sensor>
 
       <sensor name="tof_right" type="gpu_lidar">
-        <pose>0 -0.130 -0.030 0 0 -1.5708</pose>
+        <pose>0 -0.120 -0.030 0 0 -1.5708</pose>
         <update_rate>20</update_rate><topic>tof_right</topic>
         <lidar>
           <scan><horizontal><samples>1</samples>
