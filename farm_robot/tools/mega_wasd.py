@@ -10,11 +10,11 @@ from OS key-repeat events. The first key press starts at a moderate RPM; repeate
 same-direction events increase the target linearly toward the configured maximum.
 The target never ramps by itself after key repeats stop.
 
-Space toggles the existing relay-based ``PumpController``. Because the current
-pump hardware is relay driven, ON means full output (100%); there is no PWM
-percentage control in this path. This manual bring-up tool explicitly opens the
-pump zone interlock while it is running, but retains the pump continuous-run
-watchdog and always turns the pump off during cleanup.
+Space toggles the existing MOSFET-based ``PumpController``. With the current
+LR7843 path, ON means full output (100%); there is no PWM percentage control in
+this bring-up tool. The manual test explicitly opens the pump zone interlock while
+it is running, but retains the pump continuous-run watchdog and always turns the
+pump off during cleanup.
 """
 
 from __future__ import annotations
@@ -83,7 +83,7 @@ def print_help(start_rpm: float, max_rpm: float, ramp_sec: float, turn_scale: fl
         f"First-repeat grace={INITIAL_REPEAT_GRACE_SEC:.2f}s, "
         f"release stop={RELEASE_DEADMAN_SEC:.2f}s after repeats begin."
     )
-    print("Pump: relay output, Space toggles OFF <-> ON (100%).\n")
+    print("Pump: LR7843 MOSFET output, Space toggles OFF <-> ON (100%).\n")
 
 
 def print_state(motion: MegaMotion, pump: PumpController) -> None:
@@ -180,7 +180,7 @@ def main() -> int:
         print("MegaMotion abstraction connected.")
         print(f"refresh={REFRESH_SEC:.2f}s; firmware DRIVE watchdog remains active")
         if getattr(pump, "_gpio_ready", False):
-            print("PumpController GPIO ready; Space toggles relay at 100% output")
+            print("PumpController GPIO ready; Space toggles LR7843 MOSFET at 100% output")
         else:
             print("WARNING: PumpController GPIO is not ready; Space cannot drive the pump")
         print_help(start_rpm, max_rpm, ramp_sec, turn_scale)
