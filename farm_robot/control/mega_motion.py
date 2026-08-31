@@ -75,11 +75,16 @@ def find_port() -> str:
     """Find the stable Linux USB path for an Arduino Mega."""
 
     by_id = []
-    for pattern in ("/dev/serial/by-id/*Mega*", "/dev/serial/by-id/*Arduino*"):
+    for pattern in (
+        "/dev/serial/by-id/*Mega*",
+        "/dev/serial/by-id/*Arduino*",
+        "/dev/serial/by-id/*CH340*",
+        "/dev/serial/by-id/*CH341*",
+    ):
         by_id.extend(glob.glob(pattern))
     if by_id:
         return sorted(set(by_id))[0]
-    candidates = sorted(glob.glob("/dev/ttyACM*"))
+    candidates = sorted(glob.glob("/dev/ttyACM*")) + sorted(glob.glob("/dev/ttyUSB*"))
     if candidates:
         return candidates[0]
     raise MegaMotionError("Arduino Mega USB serial port not found")
@@ -247,9 +252,6 @@ class MegaMotion:
             if line == "READY MEGA_MOTION_V2":
                 with self._condition:
                     if self.protocol_ready:
-                        # USB CDC re-enumeration or a Mega reset zeroes the firmware
-                        # encoder counters. Never turn that reset into a huge fake
-                        # odometry delta or silently resume a motion command.
                         self._previous_degrees = None
                         self.last_error = "Mega reboot detected after link establishment"
                         self.faulted = True
@@ -278,15 +280,23 @@ class MegaMotion:
                 state.right_degrees - previous[1],
             )
 
+    def set_wheel_rpm(self, left_rpm: float, right_rpm: float) -> bool:
+        """Send physical output-shaft RPM targets through the Mega abstraction."""
+        left = float(left_rpm)
+        right = float(right_rpm)
+        if not math.isfinite(left) or not math.isfinite(right):
+            raise ValueError("wheel RPM targets must be finite")
+        return self._send(f"DRIVE {left:.3f} {right:.3f}")
+
     # Continuous navigation commands. Values remain normalized at the FSM
     # boundary, but USB carries physical output-shaft RPM.
     def set_speeds(self, left_speed: float, right_speed: float) -> bool:
         left = self._clamp(left_speed)
         right = self._clamp(right_speed)
         self.last_left, self.last_right = left, right
-        return self._send(
-            f"DRIVE {left * MEGA_DRIVE_MAX_RPM:.3f} "
-            f"{right * MEGA_DRIVE_MAX_RPM:.3f}"
+        return self.set_wheel_rpm(
+            left * MEGA_DRIVE_MAX_RPM,
+            right * MEGA_DRIVE_MAX_RPM,
         )
 
     def drive(self, base_speed: float, steer: float) -> bool:
@@ -316,7 +326,6 @@ class MegaMotion:
         self.last_left = self.last_right = 0.0
         return self._send("STOP", allow_when_faulted=True)
 
-    # Finite encoder-position moves.
     def _new_sequence(self) -> int:
         with self._condition:
             self._next_sequence = (self._next_sequence + 1) & 0x7FFFFFFF
