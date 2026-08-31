@@ -288,15 +288,16 @@ farm_robot/
 │   ├── aruco_detector.py          마커 → 3D 위치 / 입구 정렬각
 │   ├── vision_line_detector.py    흙 HSV → 고랑 중앙선 오차
 │   ├── tof_sensor.py              VL53L1X ×2 + I2C 주소 재할당
-│   ├── odometry.py                엔코더 → x, y, θ 추정
+│   ├── odometry.py                Mega STATE 바퀴각 → x, y, θ 추정
 │   └── water_tank_sensor.py       TCRT5000 → 물 부족 (디바운스)
 │
 ├── actuators/                 ── 움직인다 ──
-│   ├── motor_driver.py            차동구동 + 데드밴드 보상 + 회전 종료보장
+│   ├── motor_driver.py            Gazebo/내부 시뮬레이션용 구동
 │   └── pump_controller.py         릴레이/MOSFET + 3중 인터록
 │
 ├── control/                   ── 계산한다 ──
 │   ├── pid_controller.py          와인드업 방지 PID
+│   ├── mega_motion.py             USB DRIVE/MOVE + 상태/안전 관리
 │   └── line_follower.py           4개 제어원 융합 → steer
 │
 ├── navigation/                ── 결정한다 ──
@@ -334,20 +335,20 @@ farm_robot/
 조향용은 EMA 필터값, "벽이 있나 없나" 판정은 **raw 값**을 씁니다. EMA 로
 판정하면 임계값에 점근할 뿐 도달하지 못해 고랑 끝 감지가 늦어집니다.
 
-**`odometry.py`** — `d_θ = (d_right − d_left) / WHEEL_BASE`, 중점 적분으로
-x, y 갱신. 단일 채널 엔코더라 회전 방향을 모르므로 **모터 드라이버가 지시한
-방향**을 받아 부호를 정합니다.
+**`odometry.py`** — Mega가 20Hz로 보고하는 좌우 출력축 누적 각도의 증분을
+받아 `d_θ = (d_right − d_left) / WHEEL_BASE`와 중점 적분으로 x, y를
+갱신합니다. A/B 쿼드러처와 좌우 전진 부호는 Mega 펌웨어에서 확정합니다.
 
 **`water_tank_sensor.py`** — 매 틱 `poll()` 로 디바운스를 진행하고,
 `is_water_low()` 는 확정 상태만 반환하는 순수 조회 함수입니다. 이 분리가
 중요한 이유는, 디바운스 함수를 고랑당 1회만 호출하면 첫 호출이 항상 False 라
 물이 떨어져도 고랑 하나를 빈 펌프로 더 돌기 때문입니다.
 
-**`motor_driver.py`** — `drive(base, steer)` 하나로 부호 규약을 일원화합니다.
-**데드밴드 보상**이 핵심인데, DC 기어모터는 듀티 0.18 이하면 아예 안 돌기
-때문에 미세 조향 명령 0.05 가 무시되면 영원히 수렴하지 못합니다.
-회전은 **부호 교차 판정 + 절대 타임아웃 + 엔코더 stall 감지** 3중으로 종료를
-보장합니다.
+**`mega_motion.py`** — 실기 모터의 단일 인터페이스입니다. 연속 조향은
+`DRIVE left_rpm right_rpm`, 정밀 회전은 `MOVE seq left_deg right_deg`로
+분리합니다. PID·엔코더·400ms watchdog은 Mega가 담당하고, Python은 USB
+연결과 ACK/DONE/STATE를 관리합니다. `motor_driver.py`는 시뮬레이션에만
+남습니다.
 
 **`pump_controller.py`** — 3중 방어. ① 고랑 밖(`set_zone(False)`)이면 무조건
 OFF ② 물 부족 시 잠금 ③ 최대 연속 가동 워치독. `tick()` 이 매 틱 릴레이
@@ -399,22 +400,17 @@ OFF ② 물 부족 시 잠금 ③ 최대 연속 가동 워치독. `tick()` 이 �
 
 | 물리핀 | BCM | 연결 대상 |
 |---|---|---|
-| 1 | 3V3 | ToF ×2 VIN, TCRT5000 VCC, 엔코더 VCC |
+| 1 | 3V3 | ToF ×2 VIN, TCRT5000 VCC |
 | 3 | GPIO2 | ToF ×2 **SDA** (공통) |
 | 5 | GPIO3 | ToF ×2 **SCL** (공통) |
 | 6 | GND | 공통 접지 |
 | 11 | GPIO17 | **좌** ToF XSHUT |
 | 13 | GPIO27 | **우** ToF XSHUT |
 | 15 | GPIO22 | TCRT5000 **OUT** (수위) |
-| 16 | GPIO23 | **좌** 엔코더 OUT |
-| 18 | GPIO24 | **우** 엔코더 OUT |
-| 29 | GPIO5 | 모터 좌 IN1 |
-| 31 | GPIO6 | 모터 좌 IN2 |
-| 32 | GPIO12 | 모터 좌 PWM (ENA) |
-| 33 | GPIO13 | 모터 우 PWM (ENB) |
 | 37 | GPIO26 | 펌프 MOSFET 게이트(SIG) |
-| 38 | GPIO20 | 모터 우 IN1 |
-| 40 | GPIO21 | 모터 우 IN2 |
+
+모터와 엔코더는 Pi 40핀 헤더에 연결하지 않습니다. Mega USB 및 BTS7960
+핀맵은 `WIRING.md`의 현재 배선표를 따릅니다.
 
 ### 7-3. 1D ToF (VL53L1X ×2)
 
@@ -765,8 +761,9 @@ config 에 붙여넣을 세 줄을 출력해 줍니다.
 1. **장애물 감지가 전혀 없습니다.** 사람·동물·돌이 앞에 있어도 모르고
    그대로 갑니다. 전방 ToF 나 범퍼 스위치 추가를 강력히 권합니다.
    **첫 주행에는 반드시 사람이 따라다니세요.**
-2. **단일 채널 엔코더** — 회전 방향을 모터 명령으로 추정합니다.
-   정밀도가 필요하면 쿼드러처(A/B) 엔코더로 교체하세요.
+2. **궤도 미끄러짐** — Mega의 A/B 쿼드러처는 출력축 회전은 정확히 재지만
+   흙 위에서 궤도가 미끄러진 거리는 알 수 없습니다. 정밀 회전에는 IMU를
+   함께 쓰는 것이 좋습니다.
 3. **비전이 색상 임계값 기반** — 그늘·역광에 약합니다.
 4. **밭 밖으로 나가는 것을 막는 물리 장치가 없습니다.** 소프트웨어
    상한뿐입니다.
@@ -777,6 +774,7 @@ config 에 붙여넣을 세 줄을 출력해 줍니다.
 |---|---|
 | `ModuleNotFoundError: sensors` | 프로젝트 루트에서 실행했는지 |
 | `ModuleNotFoundError: picamera2` | venv 를 `--system-site-packages` 로 만들었는지 |
+| Mega Motion 연결 실패 | USB와 `/dev/ttyACM0`, 사용자의 `dialout` 그룹 확인 |
 | ToF 초기화 실패 | `i2cdetect -y 1` 로 0x30/0x31, XSHUT 배선 |
 | 고랑 진입 3초 후 SAFE_HALT | ToF 가 벽을 못 봄. 장착 각도/높이 |
 | 입구에서 15초 후 SAFE_HALT | 카메라 캘리브레이션, `MOTOR_MIN_DUTY` |

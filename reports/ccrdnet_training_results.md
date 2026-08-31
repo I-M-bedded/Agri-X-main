@@ -97,3 +97,12 @@ STRUCTURE=all row lines + NAV_BAND=furrow midline bands between adjacent rows
 best @116. Test (430 frames, bottom-center furrow selection):
 median AE 1.26 deg / median lateral 3.4 px / line accuracy 69%, det 100%.
 Hard-shadow, stubble, dense-weed frames self-report conf<=0.08 (gated out).
+
+## CRDLD grayscale-camera follow-up
+
+See [crdld_grayscale_experiment.md](crdld_grayscale_experiment.md). A true
+1-channel scratch model and an RGB-warm-start grayscale model both failed the
+RGB quality gate on the untouched 430-frame test split. Best grayscale line
+IoU/accuracy was 0.097/21.9%, versus RGB 0.416/69.3%, for at most a 1.83% MAC
+reduction. Verdict: keep RGB until target monochrome-camera field data proves
+otherwise.

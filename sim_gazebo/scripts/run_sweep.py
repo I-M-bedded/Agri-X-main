@@ -63,8 +63,9 @@ def main():
     ap.add_argument("--tilt", type=float, required=True, help="현재 월드의 팻말 각")
     ap.add_argument("--marker-cm", type=float, default=20.0)
     ap.add_argument("--stage", default="entry", choices=["entry", "full"])
-    ap.add_argument("--policies", default="rotate:survey,sweep:survey,"
-                                          "creep:survey,rotate:tof")
+    ap.add_argument("--policies",
+                    default="rotate:survey,sweep:survey,creep:survey,"
+                            "back:survey,rotate:tof,sweep:tof,creep:tof,back:tof")
     ap.add_argument("--starts", default="all",
                     help="all 또는 인덱스 목록(예: 0,2,4)")
     ap.add_argument("--seed", type=int, default=0)

@@ -93,12 +93,21 @@ def main():
     parser.add_argument("--component-mode", default="largest",
                         choices=["largest", "bottom_center", "scored"],
                         help="NAV_BAND component selection for validation metrics")
+    parser.add_argument("--grayscale", action="store_true",
+                        help="train a true one-channel model for a monochrome camera")
+    parser.add_argument("--replicate-gray-to-rgb", action="store_true",
+                        help="repeat 1-channel gray inside the model to reuse an RGB stem")
     args = parser.parse_args()
+
+    if args.replicate_gray_to_rgb and not args.grayscale:
+        parser.error("--replicate-gray-to-rgb requires --grayscale")
 
     seed_everything(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     config = CCRDNetConfig(
+        in_channels=1 if args.grayscale else 3,
+        replicate_grayscale_input=args.replicate_gray_to_rgb,
         use_dsc=not args.no_dsc,
         aspp_skip_count=0 if args.no_aspp else 3,
     )
@@ -128,8 +137,10 @@ def main():
 
     train_ds = CCRDDataset(args.data_root, "train", config.input_size,
                            augment=not args.no_augment,
-                           geometric_augment=args.geo_augment, seed=args.seed)
-    val_ds = CCRDDataset(args.data_root, "val", config.input_size, augment=False)
+                           geometric_augment=args.geo_augment, seed=args.seed,
+                           in_channels=config.in_channels)
+    val_ds = CCRDDataset(args.data_root, "val", config.input_size, augment=False,
+                         in_channels=config.in_channels)
     print(f"train={len(train_ds)} val={len(val_ds)}")
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
@@ -160,6 +171,34 @@ def main():
 
     best_iou = -1.0
     best_epoch = -1
+    if args.init_checkpoint:
+        val_loss, summary = validate(
+            model, val_loader, device, config.class_nav_band,
+            postprocess, args.line_width, criterion,
+        )
+        best_iou = summary["line_iou"]["mean"] or 0.0
+        best_epoch = 0
+        ae = summary["angle_error_deg"]["mean"]
+        lat = summary["lateral_near_px"]["mean"]
+        acc = summary["line_accuracy"]
+        det = summary["detection_rate"]
+        with open(metrics_path, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(
+                [0, "", f"{val_loss:.4f}", f"{best_iou:.4f}",
+                 "" if ae is None else f"{ae:.3f}",
+                 "" if lat is None else f"{lat:.2f}",
+                 "" if acc is None else f"{acc:.4f}",
+                 "" if det is None else f"{det:.4f}", "0.0"]
+            )
+        torch.save({"model": model.state_dict(), "epoch": 0,
+                    "val_line_iou": best_iou, "config": run_meta["config"]},
+                   os.path.join(args.out, "best.pt"))
+        print(
+            f"epoch   0 warm-start val loss {val_loss:.4f} lineIoU {best_iou:.4f} "
+            f"AE {ae if ae is None else round(ae, 2)} "
+            f"lat {lat if lat is None else round(lat, 1)}px acc {acc}",
+            flush=True,
+        )
     for epoch in range(1, args.epochs + 1):
         model.train()
         t0 = time.time()

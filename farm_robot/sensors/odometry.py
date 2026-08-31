@@ -38,6 +38,7 @@ from config import (
     ENCODER_PINS,
     ENCODER_QUAD_PINS,
     ENCODER_QUAD_TICKS_PER_REVOLUTION,
+    ODOMETRY_SOURCE,
     SIGN_LEFT_ENCODER,
     SIGN_RIGHT_ENCODER,
     TICKS_PER_REVOLUTION,
@@ -74,6 +75,8 @@ class Odometry:
         self._lock = threading.Lock()
         self._left_ticks = 0
         self._right_ticks = 0
+        self._left_distance_m = 0.0
+        self._right_distance_m = 0.0
         self.total_ticks = 0      # 엔코더 생존 확인용 (회전 stall 감지)
 
         # 단일 채널 엔코더용: 모터 드라이버가 지시 방향을 알려준다.
@@ -84,12 +87,15 @@ class Odometry:
         self._quad_left = None
         self._quad_right = None
         self._gpio_ready = False
+        self._external_ready = ODOMETRY_SOURCE == "mega_usb"
 
         # [궤도 보정] 엔코더는 '궤도가 움직인 양'을 잰다. 흙에서 헛돌면
         #   과대평가되므로 DISTANCE_CALIBRATION_FACTOR 로 실측 보정한다
         #   (tools/setup.py 4번).
         ticks_per_rev = TICKS_PER_REVOLUTION
-        if _HAS_GPIO and ENCODER_QUAD_PINS:
+        if self._external_ready:
+            log.info("오도메트리 입력: Arduino Mega USB STATE")
+        elif _HAS_GPIO and ENCODER_QUAD_PINS:
             self._setup_quadrature()
             ticks_per_rev = ENCODER_QUAD_TICKS_PER_REVOLUTION
         elif _HAS_GPIO:
@@ -162,6 +168,29 @@ class Odometry:
             self._right_ticks += right
             self.total_ticks += abs(left) + abs(right)
 
+    def inject_wheel_degrees(self, left_degrees: float, right_degrees: float):
+        """Inject logical wheel-output rotation reported by the Mega.
+
+        STATE angles already use positive=vehicle-forward for both wheels, so
+        no motor/encoder sign correction belongs on the Pi side.
+        """
+        scale = WHEEL_RADIUS_M * DISTANCE_CALIBRATION_FACTOR
+        left_m = math.radians(left_degrees) * scale
+        right_m = math.radians(right_degrees) * scale
+        with self._lock:
+            self._left_distance_m += left_m
+            self._right_distance_m += right_m
+            if abs(left_degrees) + abs(right_degrees) > 0.0:
+                self.total_ticks += 1
+
+    def _consume_injected_distance(self):
+        with self._lock:
+            left = self._left_distance_m
+            right = self._right_distance_m
+            self._left_distance_m = 0.0
+            self._right_distance_m = 0.0
+        return left, right
+
     def _consume_ticks(self):
         """이번 틱 구간의 좌/우 부호 있는 카운트를 소비한다."""
         if self._quad_left is not None:
@@ -189,15 +218,15 @@ class Odometry:
         self._prev_time = now
 
         lt, rt = self._consume_ticks()
-        if lt == 0 and rt == 0:
+        injected_left, injected_right = self._consume_injected_distance()
+        d_left = lt * self._distance_per_tick + injected_left
+        d_right = rt * self._distance_per_tick + injected_right
+        if d_left == 0.0 and d_right == 0.0:
             if dt > 0:
                 self.v = self.omega = 0.0
                 self.wheel_v = (0.0, 0.0)
             self._on_no_motion(dt)
             return
-
-        d_left = lt * self._distance_per_tick
-        d_right = rt * self._distance_per_tick
         d_center = (d_left + d_right) / 2.0
         d_theta = self._delta_theta(d_left, d_right, dt)
 
@@ -224,12 +253,14 @@ class Odometry:
     # ------------------------------------------------------------------
     def is_available(self) -> bool:
         """엔코더를 실제로 쓸 수 있는 상태인지."""
-        return self._gpio_ready or not _HAS_GPIO
+        return self._external_ready or self._gpio_ready or not _HAS_GPIO
 
     def reset(self):
         with self._lock:
             self._left_ticks = 0
             self._right_ticks = 0
+            self._left_distance_m = 0.0
+            self._right_distance_m = 0.0
         if self._quad_left is not None:
             self._quad_left.read_and_reset()
             self._quad_right.read_and_reset()

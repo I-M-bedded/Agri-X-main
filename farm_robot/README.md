@@ -1,7 +1,7 @@
 # 농장형 자율주행 급수 로봇
 
-라즈베리파이4 + RGB 카메라 + 1D ToF ×2 + 적외선 수위센서 + 엔코더 기반
-고랑 급수 로봇의 제어 소프트웨어.
+라즈베리파이4 + Arduino Mega USB 모션 제어기 + RGB 카메라 + 1D ToF ×2 +
+수위센서 기반 고랑 급수 로봇의 제어 소프트웨어.
 
 **이 파일은 설치·운용 절차서입니다.** 아래 순서대로 따라가세요.
 
@@ -47,11 +47,12 @@ farm_robot/
 │   └── water_tank_sensor.py       수위 (디바운스)
 │
 ├── actuators/                 물리 출력
-│   ├── motor_driver.py            차동구동 + 데드밴드 보상
+│   ├── motor_driver.py            Gazebo/내부 시뮬레이션용 모터
 │   └── pump_controller.py         릴레이 + 3중 인터록
 │
 ├── control/                   주행 제어
 │   ├── pid_controller.py          와인드업 방지 PID
+│   ├── mega_motion.py             Mega USB DRIVE/MOVE 통합 인터페이스
 │   └── line_follower.py           비전(주) + ToF/엔코더(보조) 융합
 │
 ├── navigation/                의사 결정
@@ -359,17 +360,19 @@ python3 -c "import cv2, numpy, RPi.GPIO, adafruit_vl53l1x, picamera2; print('전
 
 ---
 
-## 7. 배선 (BCM 핀 번호)
+## 7. 배선
 
 | 기능 | config 키 | 기본값 |
 |------|-----------|--------|
-| 좌 모터 PWM / IN1 / IN2 | `MOTOR_PINS` | 12 / 5 / 6 |
-| 우 모터 PWM / IN1 / IN2 | `MOTOR_PINS` | 13 / 20 / 21 |
+| Mega USB | `SERIAL_MEGA_PORT` | `/dev/ttyACM0`, 115200 |
+| 좌 BTS7960 RPWM / LPWM | Mega 펌웨어 | D6 / D7 |
+| 우 BTS7960 RPWM / LPWM | Mega 펌웨어 | D44 / D45 |
 | 펌프 릴레이 | `PUMP_RELAY_PIN` | 26 |
 | 좌 ToF XSHUT | `TOF_LEFT` | 17 |
 | 우 ToF XSHUT | `TOF_RIGHT` | 27 |
 | 수위 센서 | `WATER_LEVEL_SENSOR_PIN` | 22 |
-| 좌 / 우 엔코더 | `ENCODER_PINS` | 23 / 24 |
+| 좌 엔코더 A / B | Mega 펌웨어 | D2 / D3 |
+| 우 엔코더 A / B | Mega 펌웨어 | D18 / D19 |
 | I2C (ToF 공통) | 고정 | SDA=2, SCL=3 |
 
 > **전체 배선도는 `WIRING.md` 를 보세요.** 물리 핀 번호, 전원 계통,
@@ -701,8 +704,9 @@ sudo systemctl disable farm-robot    # 자동 실행 해제
 2. **장애물 감지 없음** — 사람/동물/돌이 앞에 있어도 모릅니다.
    전방 ToF나 범퍼 스위치 추가를 강력히 권장합니다.
    **첫 주행에는 반드시 사람이 따라다니세요.**
-3. **단일 채널 엔코더** — 회전 방향을 모터 명령으로 추정합니다.
-   정밀도가 필요하면 쿼드러처(A/B) 엔코더로 교체하세요.
+3. **궤도 미끄러짐** — Mega의 A/B 쿼드러처는 모터 출력축 회전은 정확히
+   재지만 흙 위에서 궤도가 미끄러진 거리는 알 수 없습니다. 정밀 회전에는
+   IMU 융합이 필요합니다.
 4. **추측항법 드리프트** — 회전이 많으면 헤딩 오차가 누적됩니다.
    근본 해결은 IMU(자이로) 융합입니다.
 5. **비전이 색상 임계값 기반** — 조명 변화에 약합니다.

@@ -32,6 +32,11 @@ from typing import Tuple
 @dataclass(frozen=True)
 class CCRDNetConfig:
     in_channels: int = 3
+    # A monochrome deployment can expose a 1-channel ONNX input while keeping
+    # the RGB stem weights: repeat gray -> RGB inside the graph. This enables
+    # exact RGB-checkpoint warm starts; it saves camera/input bandwidth, not
+    # convolution MACs.
+    replicate_grayscale_input: bool = False
     num_classes: int = 3          # OTHER / STRUCTURE / NAV_BAND
     input_size: Tuple[int, int] = (256, 256)   # (H, W)
 

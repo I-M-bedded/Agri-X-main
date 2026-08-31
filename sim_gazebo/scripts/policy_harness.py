@@ -10,10 +10,27 @@ sim_gazebo/scripts/policy_harness.py
     탐색 rotate : 제자리 회전
          sweep  : 시작 헤딩 +-55도 왕복 (회전 누적 오차를 줄인다)
          creep  : 밭 안쪽으로 천천히 전진하며 탐색 (거리를 줄여 검출률을 올린다)
+         back   : 뒤로 물러난 뒤 회전 탐색.
+                  [관측] 고랑 입구 1m 앞에서는 좌우 팻말이 화각(62도) **가장자리**
+                  에 걸려 검출되지 않는다(x=0,y=-1 에서 검출 0건, 카메라 이미지
+                  out/view_x0.png 로 확인). 물러나면 각도가 줄어 둘 다 들어온다.
     진입 survey : 측량값(이랑 간격)을 안다는 전제.
                   "팻말에서 간격/2 만큼 옆" 을 진입 목표점으로 계산한다.
          tof    : 측량값을 안 쓴다. 팻말 근처까지 간 뒤 밭 방향으로 서서
                   전진/후진+횡이동을 반복하며 ToF 로 좌우 벽을 찾는다.
+         mid    : **팻말 2개의 중점**을 진입 목표로 삼는다 + 방위도 그 2개로.
+                  고랑은 이랑 k 와 이랑 k+1 **사이**이므로, 인접한 두 팻말의
+                  중점이 곧 고랑 중심이다. 측량값(간격)을 전혀 쓰지 않으면서
+                  "팻말 + 간격/2" 보다 정확하다 -- 거리 추정 오차가 두 팻말에
+                  같은 방향으로 실려 중점에서 상당 부분 상쇄되기 때문이다.
+                  [관측] survey 는 목표를 10cm 빗나가 이랑 끝 모서리에 걸려
+                  로봇이 180도 돌아가 버렸다(참값 헤딩 91->180도).
+         pair   : survey + **팻말 2개로 밭 방위를 다시 잡는다**.
+                  [관측] 시작 헤딩이 20도 틀어지면 다른 모든 정책이 0/16 으로
+                  전멸했다. 출발 자세를 밭 방향으로 가정하기 때문이다.
+                  팻말 2개를 이으면 그 선이 곧 헤드랜드 방향이므로, 수직이
+                  밭 방향이다. **단일 마커 yaw 추정(기각됨)을 쓰지 않는다** --
+                  베어링과 거리만 쓰므로 실제 검출기로도 성립한다.
 
 ★ 설계 원칙: 로봇은 **월드 좌표를 모른다**.
   제어에 쓰는 자세는 명령속도를 적분한 데드레커닝(=엔코더 오도메트리)뿐이다.
@@ -43,6 +60,7 @@ from gz.msgs10.laserscan_pb2 import LaserScan
 from gz.msgs10.image_pb2 import Image
 from gz.msgs10.twist_pb2 import Twist
 from gz.msgs10.pose_v_pb2 import Pose_V
+from gz.msgs10.odometry_pb2 import Odometry
 from gz.transport13 import Node
 
 # ---- 밭/로봇 상수 ----
@@ -62,6 +80,12 @@ VIS_ERR_BAD = 0.9
 VIS_CONF_RANGE = (0.55, 0.73)
 
 DT = 0.05                   # 20Hz 제어 주기
+
+# 밭에 실제로 존재하는 고랑 팻말 ID 상한. 이보다 큰 ID 는 오검출로 본다.
+#   [관측] 실제 검출기가 이랑 텍스처에서 ID 190 같은 **가짜 마커**를 만들어
+#   냈고, 그것으로 밭 방위를 잡으면 오차가 +20.6도까지 벌어졌다.
+#   (END 팻말 249 는 진입 후보/방위 기준에서 제외된다)
+MAX_FURROW_MARKER_ID = 20
 
 
 def wrap(a):
@@ -83,6 +107,9 @@ class PolicyHarness:
         self.node.subscribe(LaserScan, "/tof_left", self._on_tof_l)
         self.node.subscribe(LaserScan, "/tof_right", self._on_tof_r)
         self.node.subscribe(Pose_V, "/world/field/dynamic_pose/info", self._on_pose)
+        # /odom = DiffDrive 가 **바퀴 조인트 회전**으로 만든 오도메트리
+        #   = 실기의 엔코더 오도메트리와 같은 정보(미끄러지면 그대로 틀어진다).
+        self.node.subscribe(Odometry, "/odom", self._on_odom)
         self.pub = self.node.advertise("/cmd_vel", Twist)
 
         # OpenCV 4.6(컨테이너)은 ArucoDetector 클래스가 없다 -> 구 API 병행
@@ -102,10 +129,18 @@ class PolicyHarness:
         self._det = (cv2.aruco.ArucoDetector(self._dict, p)
                      if hasattr(cv2.aruco, "ArucoDetector") else None)
 
-        # 데드레커닝(=엔코더 오도메트리). 제어는 **이것만** 본다.
+        # 제어가 쓰는 자세는 **엔코더 오도메트리뿐**이다.
         # 시작 자세를 원점, 밭 방향을 +y 로 가정한다(사용자 전제: 밭을 보고 출발).
+        #   [수정] 예전에는 명령속도를 적분했는데, 트랙이 지면에 끌리면서
+        #   명령 -98도 회전이 실제 -25도로 나오는 등 **4배 과대평가**되었다.
+        #   /odom(바퀴 회전 기반)을 쓰면 그 오차가 실기와 같은 방식으로 들어온다.
+        self._odom_raw = None
+        self._odom0 = None
         self.od = [0.0, 0.0, math.radians(90.0)]
         self.cmd = (0.0, 0.0)
+        # 밭 방향(od 프레임). 기본값은 '출발 시 밭을 보고 있다'는 가정.
+        self.field_th = math.radians(90.0)
+        self._mpos = {}                 # id -> od 좌표 (가장 최근 관측)
 
         self.r = {
             "search": args.search, "entry": args.entry,
@@ -139,6 +174,28 @@ class PolicyHarness:
     def _on_tof_r(self, msg):
         if len(msg.ranges):
             self.tof_r = msg.ranges[0]
+
+    def _on_odom(self, msg):
+        p = msg.pose.position
+        q = msg.pose.orientation
+        yaw = math.atan2(2 * (q.w * q.z + q.x * q.y),
+                         1 - 2 * (q.y * q.y + q.z * q.z))
+        self._odom_raw = (p.x, p.y, yaw)
+
+    def _update_od(self):
+        """/odom 을 '시작 자세 = 원점, 밭 방향 = +y' 인 od 프레임으로 옮긴다."""
+        if self._odom_raw is None:
+            return
+        if self._odom0 is None:
+            self._odom0 = self._odom_raw
+        x, y, th = self._odom_raw
+        x0, y0, th0 = self._odom0
+        dx, dy = x - x0, y - y0
+        c, s = math.cos(-th0), math.sin(-th0)
+        rx = (c * dx - s * dy) * (1.0 + self.a.slip)   # 엔코더 스케일 오차
+        ry = (s * dx + c * dy) * (1.0 + self.a.slip)
+        # 로봇 전방을 od 의 +y 로 (전방=+y, 좌측=-x)
+        self.od = [-ry, rx, wrap(math.pi / 2 + wrap(th - th0))]
 
     def _on_pose(self, msg):
         for p in msg.pose:
@@ -224,13 +281,7 @@ class PolicyHarness:
         self.pub.publish(m)
         self.cmd = (lin, ang)
 
-        # 데드레커닝: 명령속도를 적분한다(엔코더 오도메트리와 같은 정보량).
-        # 미끄러짐은 슬립 계수로 흉내낸다 -> 오도메트리가 서서히 틀어진다.
-        s = self.a.slip
-        self.od[2] = wrap(self.od[2] + ang * (1 - s) * DT)
-        self.od[0] += lin * (1 - s) * DT * math.cos(self.od[2])
-        self.od[1] += lin * (1 - s) * DT * math.sin(self.od[2])
-
+        self._update_od()
         self.r["ticks"] += 1
         self._score_tick()
         time.sleep(DT)
@@ -254,6 +305,10 @@ class PolicyHarness:
     def scan_tick(self):
         """마커 관측 기록(모든 상태에서 매 틱 호출)."""
         seen = self.see_markers()
+        for i, b, d in seen:
+            th = self.od[2] + b
+            self._mpos[i] = (self.od[0] + d * math.cos(th),
+                             self.od[1] + d * math.sin(th))
         if seen:
             self.r["detect_frames"] += 1
             for i, _, _ in seen:
@@ -275,11 +330,22 @@ class PolicyHarness:
             seen = self.scan_tick()
             for i, b, d in seen:
                 hits.setdefault(i, []).append((b, d))
-            ready = [i for i, v in hits.items() if len(v) >= 3 and i < 200]
+            # 너무 먼 팻말은 무시한다. 회전 중에 밭 반대편 팻말이 먼저 잡히면
+            # 엉뚱한 고랑(실측: 고랑 1 대신 고랑 4)으로 들어간다.
+            ready = [i for i, v in hits.items()
+                     if len(v) >= 3 and i <= MAX_FURROW_MARKER_ID
+                     and v[-1][1] <= self.a.max_dist]
+            # pair 정책은 밭 방위를 잡으려면 팻말이 2개 필요하다.
+            # 15초 안에 2개를 못 보면 1개로 진행한다(가정 헤딩 사용).
+            if (self.a.entry in ("pair", "mid") and len(ready) < 2
+                    and time.time() - t0 < 15.0):
+                ready = []
             if ready:
                 best = min(ready, key=lambda i: hits[i][-1][1])   # 가장 가까운 것
                 b, d = hits[best][-1]
                 self.step(0.0, 0.0)
+                if self.a.entry in ("pair", "mid"):
+                    self.r["anchored"] = self.anchor_field_heading()
                 return best, b, d
 
             if self.a.search == "rotate":
@@ -288,6 +354,12 @@ class PolicyHarness:
                 if abs(wrap(self.od[2] - yaw0)) > sweep_amp:
                     sweep_dir = -math.copysign(1.0, wrap(self.od[2] - yaw0))
                 self.step(0.0, 0.5 * sweep_dir)
+            elif self.a.search == "back":
+                # 1단계: 밭에서 멀어져 화각을 확보한다. 2단계: 회전 탐색.
+                if self.od[1] > -1.2:
+                    self.step(-0.20, 0.0)
+                else:
+                    self.step(0.0, 0.5)
             elif self.a.search == "creep":
                 # 밭 안쪽으로 천천히 전진해 팻말과의 거리를 줄인다.
                 # 이랑에 올라타지 않도록 전진량을 0.8m 로 제한한다.
@@ -302,7 +374,7 @@ class PolicyHarness:
         return None, None, None
 
     # ------------------------------------------------ 이동 유틸
-    def goto(self, gx, gy, timeout=25.0, speed=0.22, stop_r=0.12,
+    def goto(self, gx, gy, timeout=25.0, speed=0.22, stop_r=0.06,
              refresh_id=None):
         """오도메트리 좌표 (gx,gy) 로 이동. 도중에 팻말을 다시 보면 목표를 갱신."""
         t0 = time.time()
@@ -340,6 +412,44 @@ class PolicyHarness:
         self.step(0.0, 0.0)
         return False
 
+    def anchor_field_heading(self, min_baseline=0.4):
+        """팻말 2개의 위치로 밭 방위를 다시 잡는다.
+
+        팻말은 헤드랜드를 따라 ID 순서대로 늘어서 있다(이랑 k 중심).
+        따라서 낮은 ID -> 높은 ID 벡터가 헤드랜드 방향이고, 그것을 +90도
+        돌리면 밭 안쪽 방향이다. 단일 마커 yaw 추정과 달리 **베어링/거리만**
+        쓰므로 실제 검출기에서도 성립한다.
+        """
+        ids = sorted(i for i in self._mpos if i <= MAX_FURROW_MARKER_ID)
+        if len(ids) < 2:
+            return False
+        # 인접한 쌍을 우선한다(가장 짧은 베이스라인이 아니라 **가장 확실한 쌍**).
+        adj = [(x, y) for x, y in zip(ids, ids[1:]) if y - x == 1]
+        a, b = adj[0] if adj else (ids[0], ids[-1])
+        vx = self._mpos[b][0] - self._mpos[a][0]
+        vy = self._mpos[b][1] - self._mpos[a][1]
+        if math.hypot(vx, vy) < min_baseline:
+            return False
+        self.field_th = wrap(math.atan2(vy, vx) + math.pi / 2)
+        self.r["field_th_deg"] = round(math.degrees(self.field_th), 1)
+        self.r["anchor_ids"] = [a, b]
+        return True
+
+    def _adjacent_pair(self):
+        """관측된 팻말 중 **ID 가 연속인** 가장 가까운 쌍의 좌표를 준다.
+
+        ID 가 1 차이여야 그 사이가 진짜 고랑이다(0 과 2 의 중점은 이랑 1 위다).
+        """
+        ids = sorted(i for i in self._mpos if i <= MAX_FURROW_MARKER_ID)
+        best = None
+        for a, b in zip(ids, ids[1:]):
+            if b - a != 1:
+                continue
+            d = min(math.hypot(*self._mpos[k]) for k in (a, b))
+            if best is None or d < best[0]:
+                best = (d, self._mpos[a], self._mpos[b])
+        return None if best is None else (best[1], best[2])
+
     def _marker_goal(self, bearing, dist):
         """관측된 팻말로 **진입 목표점**(오도메트리 좌표)을 만든다.
 
@@ -350,18 +460,28 @@ class PolicyHarness:
         th = self.od[2] + bearing
         mx = self.od[0] + dist * math.cos(th)
         my = self.od[1] + dist * math.sin(th)
-        off = SPACING / 2.0 if self.a.entry == "survey" else 0.0
-        # 진입점은 팻말보다 0.7m 앞(밭 바깥)에 둔다 -> 정면으로 들어간다
-        return mx + off, my - 0.7
+        fx, fy = math.cos(self.field_th), math.sin(self.field_th)
+        lx, ly = fy, -fx        # 밭 기준 오른쪽(= 팻말을 지나친 쪽)
+
+        if self.a.entry == "mid":
+            pair = self._adjacent_pair()
+            if pair is not None:
+                (ax, ay), (bx, by) = pair
+                cx, cy = (ax + bx) / 2.0, (ay + by) / 2.0
+                return cx - 0.5 * fx, cy - 0.5 * fy
+
+        off = 0.0 if self.a.entry == "tof" else SPACING / 2.0
+        # 진입점 = 팻말 + (지나친 쪽으로 off) - (밭 안쪽으로 0.7m)
+        return mx + off * lx - 0.7 * fx, my + off * ly - 0.7 * fy
 
     # ------------------------------------------------ 상태 2: 진입
-    def do_enter(self, timeout=30.0):
+    def do_enter(self, timeout=150.0):
         """밭 방향으로 서서 전진. 좌우 벽이 연속으로 잡히면 진입 성공."""
-        self.turn_to(math.radians(90))
+        self.turn_to(self.field_th)
         t0 = time.time()
         good = 0
         probes = 0
-        y0 = self.od[1]
+        p0 = (self.od[0], self.od[1])
         while time.time() - t0 < timeout:
             self.scan_tick()
             if self.walls_seen():
@@ -371,29 +491,46 @@ class PolicyHarness:
                     return True
             else:
                 good = 0
-            if self.od[1] - y0 > 1.2:              # 1.2m 갔는데 벽이 없다
-                if self.a.entry != "tof" or probes >= 3:
+            adv = ((self.od[0] - p0[0]) * math.cos(self.field_th)
+                   + (self.od[1] - p0[1]) * math.sin(self.field_th))
+            # [수정] 예전 0.9m 는 너무 짧았다. 진입점이 팻말 0.7m 앞이고
+            #   오도메트리가 회전 미끄러짐으로 20~25% 과대보고하기 때문에
+            #   실제로는 밭 경계 4cm 앞에서 포기했다(실측).
+            if adv > 1.6:                          # 1.6m 갔는데 벽이 없다
+                if self.a.entry != "tof" or probes >= 5:
                     self.r["fail"] = "no_walls"
                     self.step(0.0, 0.0)
                     return False
                 # tof 정책: 후진 -> 옆으로 한 칸 -> 재시도 (측량값 미사용)
                 probes += 1
-                for _ in range(int(1.4 / (0.22 * DT))):
+                for _ in range(int(1.1 / (0.22 * DT))):
                     self.step(-0.22, 0.0)
-                self.turn_to(0.0)
-                for _ in range(int(0.35 / (0.20 * DT))):
+                self.turn_to(wrap(self.field_th - math.pi / 2))   # 밭 기준 오른쪽
+                for _ in range(int(0.30 / (0.20 * DT))):
                     self.step(0.20, 0.0)
-                self.turn_to(math.radians(90))
-                y0 = self.od[1]
+                self.turn_to(self.field_th)
+                p0 = (self.od[0], self.od[1])
                 good = 0
                 continue
-            # 한쪽 벽만 보이면 그 벽에서 멀어진다
-            if 0 < self.tof_l < TOF_MAX and not (0 < self.tof_r < TOF_MAX):
-                self.step(0.16, -0.25)
-            elif 0 < self.tof_r < TOF_MAX and not (0 < self.tof_l < TOF_MAX):
-                self.step(0.16, 0.25)
-            else:
-                self.step(0.18, 0.0)
+            # [수정] 예전에는 한쪽 벽이 보이면 그냥 계속 회전시켰다. 그러면
+            #   회전이 멈추지 않아 로봇이 밭 방향에서 90도까지 돌아가
+            #   이랑 위를 옆으로 긁으며 달렸다(실측: 헤딩 0도, 오도메트리 4.3m).
+            #   이제는 **밭 방향 유지**가 기본이고, 벽은 거기에 얹는 보정일 뿐이다.
+            l_ok = 0 < self.tof_l < TOF_MAX
+            r_ok = 0 < self.tof_r < TOF_MAX
+            bias = 0.0
+            if l_ok and not r_ok:
+                bias = -(0.35 if self.tof_l < 0.18 else 0.20)   # 왼쪽 벽 -> 우로
+            elif r_ok and not l_ok:
+                bias = +(0.35 if self.tof_r < 0.18 else 0.20)
+            hold = 2.0 * wrap(self.field_th - self.od[2])       # 밭 방향 유지
+            self.step(0.14, max(-0.6, min(0.6, hold + bias)))
+            if self.a.debug and self.r["ticks"] % 20 == 0:
+                self._dbg(f"  enter adv={adv:.2f} od=({self.od[0]:.2f},"
+                          f"{self.od[1]:.2f},{math.degrees(self.od[2]):.0f}) "
+                          f"truth=({self.truth[0]:.2f},{self.truth[1]:.2f},"
+                          f"{math.degrees(self.truth[2]):.0f}) "
+                          f"tof=({self.tof_l:.2f},{self.tof_r:.2f})")
         self.r["fail"] = self.r["fail"] or "enter_timeout"
         self.step(0.0, 0.0)
         return False
@@ -427,6 +564,8 @@ class PolicyHarness:
     # ------------------------------------------------ 실행
     def run(self):
         time.sleep(3.0)                              # 첫 센서 프레임 대기
+        self._odom0 = self._odom_raw                 # 이번 시행의 오도메트리 원점
+        self._update_od()
         if self.frame is None:
             self.r["fail"] = "no_camera"
             return self.r
@@ -470,18 +609,22 @@ class PolicyHarness:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--search", default="rotate",
-                    choices=["rotate", "sweep", "creep"])
-    ap.add_argument("--entry", default="survey", choices=["survey", "tof"])
+                    choices=["rotate", "sweep", "creep", "back"])
+    ap.add_argument("--entry", default="survey",
+                    choices=["survey", "tof", "pair", "mid"])
     ap.add_argument("--stage", default="entry", choices=["entry", "full"])
     ap.add_argument("--vision", default="measured", choices=["measured", "blind"])
     ap.add_argument("--veto", type=float, default=0.15)
-    ap.add_argument("--slip", type=float, default=0.03)
+    ap.add_argument("--slip", type=float, default=0.0,
+                    help="엔코더 스케일 오차(0.03=3%%). 실제 미끄러짐은 물리가 낸다")
     ap.add_argument("--marker-cm", type=float, default=20.0)
     ap.add_argument("--tilt", type=float, default=30.0)   # 기록용(실제 각은 월드)
     ap.add_argument("--start-x", type=float, default=-0.9)
     ap.add_argument("--start-y", type=float, default=-1.0)
     ap.add_argument("--start-yaw", type=float, default=90.0)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--max-dist", type=float, default=3.0,
+                    help="이 거리보다 먼 팻말은 무시(엉뚱한 고랑 진입 방지)")
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
 

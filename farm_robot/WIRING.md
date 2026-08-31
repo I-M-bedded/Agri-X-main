@@ -14,20 +14,13 @@
 
 | 기능 | config 키 | BCM | 물리핀 | 방향 | 비고 |
 |---|---|---|---|---|---|
-| 좌 모터 PWM | `MOTOR_PINS["left_pwm"]` | **12** | 32 | OUT | 하드웨어 PWM0 채널 |
-| 좌 모터 IN1 | `MOTOR_PINS["left_in1"]` | **5** | 29 | OUT | |
-| 좌 모터 IN2 | `MOTOR_PINS["left_in2"]` | **6** | 31 | OUT | |
-| 우 모터 PWM | `MOTOR_PINS["right_pwm"]` | **13** | 33 | OUT | 하드웨어 PWM1 채널 |
-| 우 모터 IN1 | `MOTOR_PINS["right_in1"]` | **20** | 38 | OUT | |
-| 우 모터 IN2 | `MOTOR_PINS["right_in2"]` | **21** | 40 | OUT | |
+| Mega 제어 링크 | `SERIAL_MEGA_PORT` | — | USB | 양방향 | `/dev/ttyACM0`, 115200 |
 | 펌프 스위치 | `PUMP_RELAY_PIN` | **26** | 37 | OUT | HIGH = ON (아래 §5) |
 | 좌 ToF XSHUT | `TOF_LEFT["xshut_pin"]` | **17** | 11 | OUT | |
 | 우 ToF XSHUT | `TOF_RIGHT["xshut_pin"]` | **27** | 13 | OUT | |
 | I2C SDA | (고정) | **2** | 3 | — | ToF 2개 공통 |
 | I2C SCL | (고정) | **3** | 5 | — | ToF 2개 공통 |
 | 수위 센서 | `WATER_LEVEL_SENSOR_PIN` | **22** | 15 | IN | 내부 풀다운 |
-| 좌 엔코더 | `ENCODER_PINS["left"]` | **23** | 16 | IN | 내부 풀업 |
-| 우 엔코더 | `ENCODER_PINS["right"]` | **24** | 18 | IN | 내부 풀업 |
 | 카메라 | `CAMERA_INDEX = 0` | — | — | — | GPIO 아님. CSI 리본 |
 
 **쓰는 전원 핀**
@@ -82,58 +75,28 @@
 
 ---
 
-## 3. 모터 드라이버
+## 3. Arduino Mega + BTS7960 모터 드라이버
 
-`config.py` 는 L298N / TB6612FNG 양쪽을 상정합니다. 핀 이름만 다릅니다.
+라즈베리파이는 모터 GPIO를 직접 구동하지 않고 Mega와 USB로만 연결합니다.
+아래 핀은 `agrix_motor_mega.ino`의 현재 핀맵입니다.
 
-### L298N 기준
+| 기능 | Arduino Mega 핀 | 연결 |
+|---|---:|---|
+| 좌 BTS7960 RPWM | **D6** | Motor 1 RPWM |
+| 좌 BTS7960 LPWM | **D7** | Motor 1 LPWM |
+| 우 BTS7960 RPWM | **D44** | Motor 2 RPWM |
+| 우 BTS7960 LPWM | **D45** | Motor 2 LPWM |
+| 좌 엔코더 A/B | **D2 / D3** | Motor 1 encoder A/B |
+| 우 엔코더 A/B | **D18 / D19** | Motor 2 encoder A/B |
+| 통신 | **USB-B** | Pi USB, `/dev/ttyACM0`, 115200 |
 
-| 드라이버 단자 | 연결 | BCM / 물리핀 |
-|---|---|---|
-| ENA | 좌 PWM | 12 / 32 |
-| IN1 | 좌 IN1 | 5 / 29 |
-| IN2 | 좌 IN2 | 6 / 31 |
-| ENB | 우 PWM | 13 / 33 |
-| IN3 | 우 IN1 | 20 / 38 |
-| IN4 | 우 IN2 | 21 / 40 |
-| +12V | 배터리 12V | — |
-| GND | 공통 GND | Pi GND |
-| OUT1/OUT2 | 좌측 궤도 모터 | — |
-| OUT3/OUT4 | 우측 궤도 모터 | — |
-
-- **ENA / ENB 점퍼를 반드시 뽑으세요.** 꽂혀 있으면 항상 100% 출력으로
-  고정되어 PWM 이 먹지 않습니다. 미세 조향이 전부 무시되고 정렬이 수렴하지
-  않아 `SAFE_HALT` 로 빠집니다.
-- L298N 은 내부 강하가 2V 가까이 됩니다. 12V 를 넣어도 모터에는 10V 쯤
-  갑니다. `MOTOR_MIN_DUTY` 실측값이 높게 나오는 이유 중 하나입니다.
-
-### TB6612FNG 기준
-
-| 드라이버 단자 | 연결 |
-|---|---|
-| PWMA / AIN1 / AIN2 | 12 / 5 / 6 |
-| PWMB / BIN1 / BIN2 | 13 / 20 / 21 |
-| VM | 배터리 12V |
-| VCC | 3.3V (Pi pin 1) |
-| **STBY** | **3.3V 로 직접 물릴 것** |
-| GND | 공통 GND |
-
-> **STBY 를 띄워 두면 모터가 아예 안 돕니다.** `config.py` 에 STBY 핀이
-> 없으므로 코드가 올려 주지 않습니다. 3.3V 에 직결하세요.
-
-### 코드가 만드는 신호
-
-`actuators/motor_driver.py` 기준입니다.
-
-| 상태 | IN1 | IN2 | PWM |
-|---|---|---|---|
-| 정지 | LOW | LOW | 0 |
-| 전진 | HIGH | LOW | duty |
-| 후진 | LOW | HIGH | duty |
-
-방향이 반대로 나오면 **선을 바꾸지 말고** `config.py` 맨 위
-`SIGN_LEFT_MOTOR` / `SIGN_RIGHT_MOTOR` 를 `+1 ↔ -1` 로 뒤집으세요.
-`tools/setup.py` 2번이 어느 부호를 뒤집어야 하는지 알려줍니다.
+- 각 BTS7960의 `R_EN`과 `L_EN`은 HIGH로 유지합니다.
+- Mega GND, 두 BTS7960 GND, 12V 배터리 GND를 공통으로 묶습니다.
+- RPWM과 LPWM을 동시에 활성화하지 않으며 펌웨어가 20kHz PWM을 만듭니다.
+- 논리상 전진 부호는 펌웨어의 `MOTOR1_FORWARD_SIGN`과
+  `MOTOR2_FORWARD_SIGN`에서 보정합니다.
+- `actuators/motor_driver.py` 핀맵은 Gazebo/내부 시뮬레이션용이며 실기
+  배선 기준이 아닙니다.
 
 ---
 
@@ -268,28 +231,19 @@ WATER_LEVEL_DEBOUNCE_SEC = 1.0        # 1초 이상 유지돼야 인정
 
 ---
 
-## 7. 엔코더 ×2 (단일 채널)
+## 7. 엔코더 ×2 (Mega 쿼드러처)
 
 | 엔코더 단자 | 좌 | 우 |
 |---|---|---|
-| VCC | **3.3V** (pin 1) | 3.3V |
-| GND | GND | GND |
-| OUT (신호) | **GPIO23 (pin 16)** | **GPIO24 (pin 18)** |
+| VCC | 센서 사양에 맞는 전원 | 센서 사양에 맞는 전원 |
+| GND | Mega/드라이버 공통 GND | Mega/드라이버 공통 GND |
+| A | Mega **D2** | Mega **D18** |
+| B | Mega **D3** | Mega **D19** |
 
-```python
-ENCODER_EDGE = "RISING"      # 상승엣지만 카운트
-ENCODER_BOUNCETIME_MS = 1    # 채터링 방지
-```
-
-내부 풀업(`PUD_UP`)을 쓰므로 외부 풀업 저항은 필요 없습니다.
-
-> **`ENCODER_EDGE` 를 바꾸면 `TICKS_PER_REVOLUTION` 도 같이 바꿔야 합니다.**
-> 예전에 `BOTH` 로 잡아 두고 틱 수를 안 고쳐서 주행거리와 회전각이 전부
-> 2배로 계산된 적이 있습니다. `TICKS_PER_REVOLUTION` 은 "지금 엣지 설정에서
-> 1회전당 실제로 세어지는 카운트 수"입니다. `tools/setup.py` 4번이 재줍니다.
-
-단일 채널이라 **회전 방향을 못 읽습니다.** 코드가 모터 명령 부호로 추정합니다
-(알려진 한계 2번). 그래서 미끄러짐이 2% 를 넘으면 `SAFE_HALT` 로 갑니다.
+펌웨어는 네 신호를 모두 `CHANGE` 인터럽트로 읽어 x4 디코딩합니다. 현재
+JGB3865-520R45-12 가정은 `11 PPR × 45:1 × 4 = 1,980 count/output-rev`입니다.
+`STATE`가 보고하는 각도는 이미 좌우 모두 `양수=차체 전진`으로 정규화되어
+있으며 Pi 오도메트리는 이 각도 증분을 사용합니다.
 
 ---
 

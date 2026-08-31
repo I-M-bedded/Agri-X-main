@@ -55,7 +55,10 @@ class CCRDDataset(Dataset):
         augment: bool = False,
         geometric_augment: bool = False,
         seed: int = 42,
+        in_channels: int = 3,
     ):
+        if in_channels not in (1, 3):
+            raise ValueError("in_channels must be 1 (grayscale) or 3 (RGB)")
         self.root = root
         self.names = read_manifest(root, split)
         self.input_size = input_size
@@ -63,6 +66,7 @@ class CCRDDataset(Dataset):
         self.augment = augment
         self.geometric_augment = geometric_augment
         self.rng = random.Random(seed)
+        self.in_channels = in_channels
 
     def __len__(self) -> int:
         return len(self.names)
@@ -117,7 +121,14 @@ class CCRDDataset(Dataset):
         th, tw = self.input_size
         image_r, _ = preprocess_image(image, (tw, th), self.resize_mode)
         mask_r, _ = preprocess_mask(mask, (tw, th), self.resize_mode)
-        tensor = torch.from_numpy(image_r.astype(np.float32) / 255.0).permute(2, 0, 1)
+        if self.in_channels == 1:
+            # Match a monochrome camera input. Conversion happens after colour
+            # augmentation so RGB and grayscale experiments see the same
+            # geometric/illumination perturbations for a fixed seed.
+            image_r = cv2.cvtColor(image_r, cv2.COLOR_RGB2GRAY)
+            tensor = torch.from_numpy(image_r.astype(np.float32) / 255.0).unsqueeze(0)
+        else:
+            tensor = torch.from_numpy(image_r.astype(np.float32) / 255.0).permute(2, 0, 1)
         target = torch.from_numpy(mask_r.astype(np.int64))
         return tensor, target, name
 

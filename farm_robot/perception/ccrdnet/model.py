@@ -20,6 +20,8 @@ from perception.ccrdnet.config import CCRDNetConfig
 class CCRDNet(nn.Module):
     def __init__(self, config: CCRDNetConfig = CCRDNetConfig()):
         super().__init__()
+        if config.replicate_grayscale_input and config.in_channels != 1:
+            raise ValueError("replicate_grayscale_input requires in_channels=1")
         self.config = config
         block = DSCBlock if config.use_dsc else PlainConvBlock
         channels = config.encoder_channels
@@ -28,7 +30,7 @@ class CCRDNet(nn.Module):
 
         # Encoder: stage 0 at full resolution, each later stage after a 2x pool.
         self.encoder = nn.ModuleList()
-        previous = config.in_channels
+        previous = 3 if config.replicate_grayscale_input else config.in_channels
         for width in channels:
             self.encoder.append(block(previous, width))
             previous = width
@@ -58,7 +60,11 @@ class CCRDNet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         skips: List[torch.Tensor] = []
-        out = self.pool(x) if self.config.stem_downsample else x
+        if self.config.replicate_grayscale_input:
+            x_model = x.repeat(1, 3, 1, 1)
+        else:
+            x_model = x
+        out = self.pool(x_model) if self.config.stem_downsample else x_model
         for index, stage in enumerate(self.encoder):
             if index > 0:
                 out = self.pool(out)

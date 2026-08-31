@@ -1014,37 +1014,30 @@ ENCODER_QUAD_TICKS_PER_REVOLUTION = ENCODER_PPR * ENCODER_DECODE * ENCODER_GEAR_
 #                 IMU 가 죽으면 자동으로 encoder 방식 폴백.
 # =========================================================
 ODOMETRY_BACKEND = "encoder"       # "encoder" | "encoder_imu"
+# Wheel encoder angles arrive in Mega STATE messages over USB. Keep GPIO
+# encoder ownership on the Mega; the Pi must not configure duplicate pins.
+ODOMETRY_SOURCE = "mega_usb"        # "mega_usb" | "gpio"
 IMU_I2C_BUS = 1
 IMU_I2C_ADDRESS = 0x68             # MPU-6050 기본 (AD0=LOW)
 IMU_CALIBRATION_SEC = 2.0          # 시작 시 정지 상태 바이어스 측정 시간
 SIGN_IMU_YAW = +1                  # CCW 양수가 되도록. 반대면 -1 로 뒤집기
 
 # =========================================================
-# 13-2. 구동 계층 (DRIVE_MODE)
+# 13-2. Arduino Mega 하이브리드 구동 계층 (USB)
 # ---------------------------------------------------------
-# "open_loop"   : 기존 방식. 명령 [-1,1] 을 그대로 듀티로.
-# "closed_loop" : 명령을 목표 바퀴속도(m/s)로 환산해 엔코더 실측과 비교,
-#                 피드포워드+PI 로 추종 (actuators/closed_loop_drive.py).
-#                 배터리 전압/흙 부하가 변해도 같은 명령 = 같은 속도.
-#                 쿼드러처 엔코더 활성 후에 켤 것.
+# 실기 구동은 control/mega_motion.py 한 경로만 사용한다.
+#   DRIVE left_rpm right_rpm              연속 비전/ToF 조향
+#   MOVE seq left_deg right_deg max_rpm   정밀 회전/유한 이동
+# 엔코더 인터럽트, 1 kHz 속도 PID, 400 ms DRIVE watchdog은 Mega가 담당한다.
+# 펌웨어: firmware/agrix_motor_mega/agrix_motor_mega.ino
 # =========================================================
-# "serial_mega" : 상위=라즈베리파이5, 하위=아두이노 메가(속도 PID).
-#                 Pi 는 "좌우 몇 m/s" 만 USB 로 내려보내고, 엔코더 인터럽트와
-#                 100Hz 속도 루프는 메가가 맡는다.
-#                 (Pi 는 리눅스 지터로 100Hz 루프가 흔들리고, 파이썬 콜백으로는
-#                  13PPR x 4체배 엔코더 인터럽트를 놓친다)
-#                 펌웨어: firmware/agrix_motor_mega/agrix_motor_mega.ino
-DRIVE_MODE = "serial_mega"    # "serial_mega" | "open_loop" | "closed_loop"
-
-# --- 아두이노 메가 USB 링크 ---
-SERIAL_MEGA_PORT = "/dev/ttyACM0"     # Pi5 에서 메가가 잡히는 포트
+SERIAL_MEGA_PORT = "/dev/ttyACM0"  # 가능하면 /dev/serial/by-id/... 사용
 SERIAL_MEGA_BAUD = 115200
-# 메가 워치독(펌웨어 400ms)이 걸리지 않게 이 주기로 현재 명령을 재전송한다.
-SERIAL_MEGA_KEEPALIVE_SEC = 0.15
-MAX_WHEEL_SPEED_MPS = 0.6          # 명령 1.0 에 대응하는 바퀴 선속도 ★ 실측
-WHEEL_PID_KP = 0.5
-WHEEL_PID_KI = 1.0
-WHEEL_PID_INTEGRAL_LIMIT = 0.3
+SERIAL_MEGA_RESET_DELAY_SEC = 2.0  # USB CDC open 시 Mega 자동 reset 대기
+MEGA_DRIVE_MAX_RPM = 80.0          # 상위 [-1,1] 명령의 출력축 RPM
+MEGA_ACK_TIMEOUT_SEC = 1.0
+MEGA_MOVE_TIMEOUT_SEC = 12.0
+MEGA_HEARTBEAT_SEC = 0.20          # 블로킹 MOVE 중에만 전송
 
 # =========================================================
 # 13-3. 수위 소스 (Nano USB 링크)

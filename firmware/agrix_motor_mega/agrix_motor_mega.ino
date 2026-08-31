@@ -1,224 +1,526 @@
+#include <Arduino.h>
+#include <util/atomic.h>
+
 /*
- * agrix_motor_mega.ino  —  Agri-X 하위 제어기 (Arduino Mega 2560)
- * ---------------------------------------------------------------
- * 역할 분담
- *   상위(라즈베리파이 5)  : 비전/ToF/마커/FSM. "좌우 바퀴를 몇 m/s 로 돌려라"만 내려보낸다.
- *   하위(이 스케치, Mega) : 엔코더를 읽어 **속도 PID** 로 그 명령을 추종한다.
+ * Agri-X Mega Motion V2 - USB hybrid velocity/position controller
  *
- * 왜 나누는가
- *   Pi 는 리눅스라 수십 ms 단위 지터가 있어 100Hz 속도 루프를 안정적으로 돌리기 어렵다.
- *   엔코더 인터럽트도 Pi 의 파이썬 콜백으로는 카운트를 놓친다(13PPR x 4체배 x 감속비).
- *   Mega 는 지터 없이 100Hz 로 돌고 인터럽트를 놓치지 않는다.
+ * Pi -> Mega (115200 baud, newline-delimited ASCII)
+ *   DRIVE <left_rpm> <right_rpm>              continuous navigation
+ *   MOVE <seq> <left_deg> <right_deg> <rpm>   finite encoder move
+ *   HB | STOP | STATUS | PING
  *
- * 엔코더
- *   13 PPR, A/B 쿼드러처, 4체배 -> 모터축 1회전당 52 카운트.
- *   바퀴축 카운트 = 52 * GEAR_RATIO.  ★ GEAR_RATIO 는 반드시 실측해서 넣을 것.
- *   Mega 의 외부 인터럽트 핀: 2,3,18,19,20,21 (20/21 은 I2C 와 겸용이므로 피함)
+ * Mega -> Pi
+ *   STATE <seq> <mode> <left_deg> <right_deg> <left_rpm> <right_rpm> (20 Hz)
+ *   ACK <seq> | DONE <seq> | STOPPED | PONG | ERR <reason>
  *
- * 시리얼 프로토콜 (USB, 115200)  — 줄 단위 ASCII
- *   Pi -> Mega
- *     "V <left_mps> <right_mps>\n"   속도 명령 (m/s, 부호 = 전/후진)
- *     "S\n"                          즉시 정지
- *     "P <kp> <ki> <kd>\n"           PID 게인 변경 (현장 튜닝용)
- *     "?\n"                          상태 1회 요청
- *   Mega -> Pi  (기본 20Hz 자동 송신)
- *     "T <l_mps> <r_mps> <l_ticks> <r_ticks> <l_duty> <r_duty> <flags>\n"
- *     flags bit0 = 워치독 정지 상태
- *
- * 안전
- *   WATCHDOG_MS 안에 새 명령이 없으면 **스스로 정지**한다.
- *   USB 케이블이 빠지거나 Pi 가 죽어도 로봇이 계속 달리지 않게 하는 마지막 방어선이다.
+ * DRIVE must be refreshed by the Pi control loop and times out after 400 ms.
+ * HB is intended only for a blocking MOVE. USB disconnect therefore stops
+ * either mode without depending on Linux or Python cleanup.
  */
 
-#include <Arduino.h>
+/* BTS7960 pin map: keep R_EN/L_EN high on each driver. */
+constexpr uint8_t MOTOR1_RPWM_PIN = 6;   // Timer4 OC4A
+constexpr uint8_t MOTOR1_LPWM_PIN = 7;   // Timer4 OC4B
+constexpr uint8_t MOTOR2_RPWM_PIN = 44;  // Timer5 OC5C
+constexpr uint8_t MOTOR2_LPWM_PIN = 45;  // Timer5 OC5B
 
-// ---------------- 핀맵 (★ 실제 배선에 맞게 수정) ----------------
-// 모터 드라이버 (BTS7960 / L298N 등 PWM+DIR 방식 가정)
-const uint8_t PIN_L_PWM = 9;
-const uint8_t PIN_L_DIR = 8;
-const uint8_t PIN_R_PWM = 10;
-const uint8_t PIN_R_DIR = 11;
+constexpr uint8_t ENCODER1_A_PIN = 2;
+constexpr uint8_t ENCODER1_B_PIN = 3;
+constexpr uint8_t ENCODER2_A_PIN = 18;
+constexpr uint8_t ENCODER2_B_PIN = 19;
 
-// 엔코더 A/B  (A 는 반드시 인터럽트 핀)
-const uint8_t PIN_ENC_L_A = 2;    // INT0
-const uint8_t PIN_ENC_L_B = 4;
-const uint8_t PIN_ENC_R_A = 3;    // INT1
-const uint8_t PIN_ENC_R_B = 5;
+// JGB3865-520R45-12 assumption: 11 pulses/motor-rev * 45:1 * x4 decode.
+constexpr float ENCODER1_CPR = 1980.0f;
+constexpr float ENCODER2_CPR = 1980.0f;
+constexpr int8_t ENCODER1_SIGN = 1;
+constexpr int8_t ENCODER2_SIGN = 1;
 
-// ---------------- 기구 파라미터 (★ 실측) ----------------
-const float PPR          = 13.0f;   // 엔코더 pulse/rev (모터축)
-const float DECODE       = 4.0f;    // 4체배
-const float GEAR_RATIO   = 1.0f;    // ★ 모터축 -> 바퀴축 감속비. 반드시 실측
-const float WHEEL_RADIUS = 0.033f;  // m (궤도 두께 포함 유효 반지름)
-const float TICKS_PER_WHEEL_REV = PPR * DECODE * GEAR_RATIO;
-const float METERS_PER_TICK = (2.0f * PI * WHEEL_RADIUS) / TICKS_PER_WHEEL_REV;
+// Positive logical wheel rotation means vehicle-forward rotation.
+constexpr int8_t MOTOR1_FORWARD_SIGN = -1;
+constexpr int8_t MOTOR2_FORWARD_SIGN = 1;
 
-// ---------------- 제어 파라미터 ----------------
-const uint16_t CONTROL_HZ   = 100;
-const uint16_t CONTROL_MS   = 1000 / CONTROL_HZ;
-const uint16_t TELEM_MS     = 50;     // 20Hz 텔레메트리
-const uint16_t WATCHDOG_MS  = 400;    // 이 시간 무명령 -> 정지
-const float MAX_MPS         = 0.60f;  // ★ 실측: 듀티 100% 일 때의 바퀴 선속도
-const uint8_t MIN_DUTY      = 40;     // 데드밴드 보상(0~255). ★ 실측
-float Kp = 220.0f, Ki = 900.0f, Kd = 0.0f;   // 출력 단위 = PWM count
-const float I_LIMIT = 200.0f;
+constexpr float MANUAL_RPM = 80.0f;
+constexpr float MAX_COMMAND_RPM = 150.0f;
+constexpr float MAX_DUTY = 0.45f;
+constexpr float POSITION_KP_RPM_PER_DEG = 1.0f;
+constexpr float POSITION_TOLERANCE_DEG = 2.0f;
+constexpr float SETTLED_RPM = 3.0f;
+constexpr uint16_t SETTLED_TIME_MS = 150U;
+// DRIVE is refreshed by the Pi control loop. A short watchdog is the final
+// safety layer for a dead process or unplugged USB cable.
+constexpr uint32_t DRIVE_TIMEOUT_MS = 400UL;
+constexpr uint32_t LINK_TIMEOUT_MS = 1000UL;
+constexpr uint32_t CONTROL_PERIOD_US = 1000UL;
+constexpr uint32_t POSITION_PERIOD_US = 10000UL;
+constexpr uint16_t TELEMETRY_PERIOD_MS = 50U;
+constexpr uint16_t PWM_TOP = 799U; // 16 MHz / (799 + 1) = 20 kHz
 
-// ---------------- 엔코더 상태 ----------------
-volatile long encL = 0, encR = 0;
-
-// A 상승 에지에서 B 레벨로 방향 판정(2체배 상당). 4체배가 필요하면
-// B 핀도 인터럽트 핀에 물리고 아래 ISR 을 하나 더 붙이면 된다.
-void isrLeftA()  { encL += (digitalRead(PIN_ENC_L_B) ? 1 : -1); }
-void isrRightA() { encR += (digitalRead(PIN_ENC_R_B) ? 1 : -1); }
-
-// ---------------- PID 상태 ----------------
-struct Wheel {
-  float target = 0.0f;      // m/s
-  float measured = 0.0f;    // m/s
-  float integral = 0.0f;
-  float prevErr = 0.0f;
-  int   duty = 0;           // -255 ~ 255
-  long  lastTicks = 0;
+struct PidController {
+  float kp;
+  float ki;
+  float kd;
+  float integrator;
+  float previousMeasurement;
+  float derivativeState;
 };
-Wheel wl, wr;
 
-bool watchdogStopped = false;
-unsigned long lastCmdMs = 0, lastCtlMs = 0, lastTelemMs = 0;
+struct MotorAxis {
+  PidController pid;
+  float targetRpm;
+  float measuredRpm;
+  float duty;
+  float encoderCpr;
+  int32_t previousCount;
+};
 
-// ---------------- 저수준 출력 ----------------
-void applyDuty(uint8_t pinPwm, uint8_t pinDir, int duty) {
-  bool forward = (duty >= 0);
-  int mag = abs(duty);
-  if (mag < 3) {                 // 완전 정지 (덜덜거림 방지)
-    digitalWrite(pinDir, LOW);
-    analogWrite(pinPwm, 0);
+enum class ControlMode : uint8_t { IDLE, MANUAL, POSITION };
+
+volatile int32_t encoderCount[2] = {0, 0};
+volatile uint8_t encoderPrevious[2] = {0, 0};
+MotorAxis motors[2];
+ControlMode controlMode = ControlMode::IDLE;
+bool motorsEnabled = false;
+int32_t positionTarget[2] = {0, 0};
+float moveMaxRpm = MANUAL_RPM;
+uint32_t activeSequence = 0;
+uint32_t lastLinkMs = 0;
+uint32_t nextControlUs = 0;
+uint32_t nextPositionUs = 0;
+uint32_t nextTelemetryMs = 0;
+uint16_t settledTimeMs = 0;
+char lineBuffer[96];
+uint8_t lineLength = 0;
+
+constexpr int8_t QUADRATURE_TRANSITION[16] = {
+   0, -1,  1,  0,
+   1,  0,  0, -1,
+  -1,  0,  0,  1,
+   0,  1, -1,  0
+};
+
+float clampFloat(float value, float low, float high) {
+  if (value > high) return high;
+  if (value < low) return low;
+  return value;
+}
+
+void updateEncoder(uint8_t motor) {
+  uint8_t current;
+  int8_t sign;
+
+  if (motor == 0) {
+    current = static_cast<uint8_t>((digitalRead(ENCODER1_A_PIN) ? 1U : 0U)
+                                  | (digitalRead(ENCODER1_B_PIN) ? 2U : 0U));
+    sign = ENCODER1_SIGN;
+  } else {
+    current = static_cast<uint8_t>((digitalRead(ENCODER2_A_PIN) ? 1U : 0U)
+                                  | (digitalRead(ENCODER2_B_PIN) ? 2U : 0U));
+    sign = ENCODER2_SIGN;
+  }
+
+  encoderCount[motor] += sign * QUADRATURE_TRANSITION[(encoderPrevious[motor] << 2U) | current];
+  encoderPrevious[motor] = current;
+}
+
+void encoder1AIsr() { updateEncoder(0); }
+void encoder1BIsr() { updateEncoder(0); }
+void encoder2AIsr() { updateEncoder(1); }
+void encoder2BIsr() { updateEncoder(1); }
+
+int32_t readEncoder(uint8_t motor) {
+  int32_t value;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    value = encoderCount[motor];
+  }
+  return value;
+}
+
+void setupPwm20kHz() {
+  pinMode(MOTOR1_RPWM_PIN, OUTPUT);
+  pinMode(MOTOR1_LPWM_PIN, OUTPUT);
+  pinMode(MOTOR2_RPWM_PIN, OUTPUT);
+  pinMode(MOTOR2_LPWM_PIN, OUTPUT);
+
+  // Timer4: mode 14 fast PWM, TOP=ICR4, no prescaler, D6/D7 outputs.
+  TCCR4A = _BV(COM4A1) | _BV(COM4B1) | _BV(WGM41);
+  TCCR4B = _BV(WGM43) | _BV(WGM42) | _BV(CS40);
+  ICR4 = PWM_TOP;
+  OCR4A = 0;
+  OCR4B = 0;
+
+  // Timer5: mode 14 fast PWM, TOP=ICR5, no prescaler, D44/D45 outputs.
+  TCCR5A = _BV(COM5C1) | _BV(COM5B1) | _BV(WGM51);
+  TCCR5B = _BV(WGM53) | _BV(WGM52) | _BV(CS50);
+  ICR5 = PWM_TOP;
+  OCR5C = 0;
+  OCR5B = 0;
+}
+
+void setMotorDuty(uint8_t motor, float duty) {
+  duty = clampFloat(duty, -MAX_DUTY, MAX_DUTY);
+  const uint16_t compare = static_cast<uint16_t>(fabs(duty) * static_cast<float>(PWM_TOP + 1U));
+
+  if (motor == 0) {
+    OCR4A = duty > 0.0f ? compare : 0;
+    OCR4B = duty < 0.0f ? compare : 0;
+  } else {
+    OCR5C = duty > 0.0f ? compare : 0;
+    OCR5B = duty < 0.0f ? compare : 0;
+  }
+}
+
+void resetPid(MotorAxis &motor) {
+  motor.pid.integrator = 0.0f;
+  motor.pid.previousMeasurement = motor.measuredRpm;
+  motor.pid.derivativeState = 0.0f;
+}
+
+float pidStep(MotorAxis &motor, float dt) {
+  const float error = motor.targetRpm - motor.measuredRpm;
+  const float rawDerivative = -(motor.measuredRpm - motor.pid.previousMeasurement) / dt;
+  motor.pid.derivativeState += 0.20f * (rawDerivative - motor.pid.derivativeState);
+
+  const float unsaturated = motor.pid.kp * error + motor.pid.integrator
+                          + motor.pid.kd * motor.pid.derivativeState;
+  const float output = clampFloat(unsaturated, -MAX_DUTY, MAX_DUTY);
+  motor.pid.integrator += (motor.pid.ki * error + 4.0f * (output - unsaturated)) * dt;
+  motor.pid.integrator = clampFloat(motor.pid.integrator, -MAX_DUTY, MAX_DUTY);
+  motor.pid.previousMeasurement = motor.measuredRpm;
+  return output;
+}
+
+void controlStep() {
+  constexpr float dt = 0.001f;
+
+  for (uint8_t i = 0; i < 2; ++i) {
+    MotorAxis &motor = motors[i];
+    const int32_t count = readEncoder(i);
+    const int32_t delta = count - motor.previousCount;
+    const float rawRpm = (static_cast<float>(delta) * 60.0f) / (motor.encoderCpr * dt);
+    motor.previousCount = count;
+    motor.measuredRpm += 0.20f * (rawRpm - motor.measuredRpm);
+
+    if (motorsEnabled) {
+      motor.duty = pidStep(motor, dt);
+    } else {
+      motor.duty = 0.0f;
+      resetPid(motor);
+    }
+    setMotorDuty(i, motor.duty);
+  }
+}
+
+void stopMotors() {
+  motors[0].targetRpm = 0.0f;
+  motors[1].targetRpm = 0.0f;
+  motorsEnabled = false;
+  controlMode = ControlMode::IDLE;
+  activeSequence = 0;
+  settledTimeMs = 0;
+  setMotorDuty(0, 0.0f);
+  setMotorDuty(1, 0.0f);
+}
+
+void resetBothPid() {
+  resetPid(motors[0]);
+  resetPid(motors[1]);
+}
+
+void driveVelocity(float logicalLeftRpm, float logicalRightRpm) {
+  logicalLeftRpm = clampFloat(logicalLeftRpm, -MAX_COMMAND_RPM, MAX_COMMAND_RPM);
+  logicalRightRpm = clampFloat(logicalRightRpm, -MAX_COMMAND_RPM, MAX_COMMAND_RPM);
+
+  if (fabs(logicalLeftRpm) < 0.01f && fabs(logicalRightRpm) < 0.01f) {
+    stopMotors();
+    lastLinkMs = millis();
     return;
   }
-  // 데드밴드 보상: MIN_DUTY ~ 255 구간으로 매핑
-  mag = MIN_DUTY + (int)((255 - MIN_DUTY) * (mag / 255.0f));
-  if (mag > 255) mag = 255;
-  digitalWrite(pinDir, forward ? HIGH : LOW);
-  analogWrite(pinPwm, mag);
+
+  // Preserve PI state while the 20 Hz Pi loop refreshes DRIVE. Reset only
+  // when changing into velocity mode, never on every command.
+  if (controlMode != ControlMode::MANUAL || !motorsEnabled) {
+    resetBothPid();
+  }
+  motors[0].targetRpm = logicalLeftRpm * MOTOR1_FORWARD_SIGN;
+  motors[1].targetRpm = logicalRightRpm * MOTOR2_FORWARD_SIGN;
+  motorsEnabled = true;
+  controlMode = ControlMode::MANUAL;
+  activeSequence = 0;
+  lastLinkMs = millis();
 }
 
-void stopAll() {
-  wl.target = wr.target = 0.0f;
-  wl.integral = wr.integral = 0.0f;
-  wl.duty = wr.duty = 0;
-  applyDuty(PIN_L_PWM, PIN_L_DIR, 0);
-  applyDuty(PIN_R_PWM, PIN_R_DIR, 0);
+int32_t degreesToCounts(float degrees, float cpr, int8_t forwardSign) {
+  const float raw = degrees * cpr * static_cast<float>(forwardSign) / 360.0f;
+  return static_cast<int32_t>(raw >= 0.0f ? raw + 0.5f : raw - 0.5f);
 }
 
-// ---------------- PID 한 스텝 ----------------
-void stepWheel(Wheel &w, long ticksNow, float dt, uint8_t pinPwm, uint8_t pinDir) {
-  long d = ticksNow - w.lastTicks;
-  w.lastTicks = ticksNow;
-  w.measured = (d * METERS_PER_TICK) / dt;
-
-  float err = w.target - w.measured;
-  w.integral += err * dt;
-  if (w.integral >  I_LIMIT) w.integral =  I_LIMIT;
-  if (w.integral < -I_LIMIT) w.integral = -I_LIMIT;
-  float deriv = (dt > 0.0f) ? (err - w.prevErr) / dt : 0.0f;
-  w.prevErr = err;
-
-  // 피드포워드(명령 자체) + PI(D) 보정
-  float ff = (w.target / MAX_MPS) * 255.0f;
-  float out = ff + Kp * err + Ki * w.integral + Kd * deriv;
-  if (out >  255.0f) out =  255.0f;
-  if (out < -255.0f) out = -255.0f;
-
-  // 목표가 0 이면 적분 잔량으로 기어가지 않게 확실히 끊는다
-  if (fabs(w.target) < 1e-4f) { out = 0.0f; w.integral = 0.0f; }
-
-  w.duty = (int)out;
-  applyDuty(pinPwm, pinDir, w.duty);
+void beginPositionMove(uint32_t sequence, float leftDegrees, float rightDegrees, float maxRpm) {
+  positionTarget[0] = readEncoder(0) + degreesToCounts(leftDegrees, ENCODER1_CPR,
+                                                       MOTOR1_FORWARD_SIGN);
+  positionTarget[1] = readEncoder(1) + degreesToCounts(rightDegrees, ENCODER2_CPR,
+                                                       MOTOR2_FORWARD_SIGN);
+  moveMaxRpm = clampFloat(fabs(maxRpm), 5.0f, MAX_COMMAND_RPM);
+  activeSequence = sequence;
+  settledTimeMs = 0;
+  resetBothPid();
+  motorsEnabled = true;
+  controlMode = ControlMode::POSITION;
+  lastLinkMs = millis();
+  nextPositionUs = micros();
 }
 
-// ---------------- 시리얼 명령 파싱 ----------------
-char buf[64];
-uint8_t buflen = 0;
+void positionStep() {
+  bool insideTolerance = true;
+  bool nearlyStopped = true;
 
-void handleLine(char *line) {
-  if (line[0] == 'V') {
-    float l = 0, r = 0;
-    if (sscanf(line + 1, "%f %f", &l, &r) == 2) {
-      if (l >  MAX_MPS) l =  MAX_MPS;
-      if (l < -MAX_MPS) l = -MAX_MPS;
-      if (r >  MAX_MPS) r =  MAX_MPS;
-      if (r < -MAX_MPS) r = -MAX_MPS;
-      wl.target = l; wr.target = r;
-      lastCmdMs = millis();
-      watchdogStopped = false;
+  for (uint8_t i = 0; i < 2; ++i) {
+    const int32_t countError = positionTarget[i] - readEncoder(i);
+    const float errorDegrees = static_cast<float>(countError) * 360.0f / motors[i].encoderCpr;
+
+    if (fabs(errorDegrees) <= POSITION_TOLERANCE_DEG) {
+      motors[i].targetRpm = 0.0f;
+    } else {
+      motors[i].targetRpm = clampFloat(POSITION_KP_RPM_PER_DEG * errorDegrees,
+                                       -moveMaxRpm, moveMaxRpm);
+      insideTolerance = false;
     }
-  } else if (line[0] == 'S') {
-    stopAll();
-    lastCmdMs = millis();
-  } else if (line[0] == 'P') {
-    float a, b, c;
-    if (sscanf(line + 1, "%f %f %f", &a, &b, &c) == 3) { Kp = a; Ki = b; Kd = c; }
-  } else if (line[0] == '?') {
-    lastTelemMs = 0;   // 즉시 1회 송신
+    if (fabs(motors[i].measuredRpm) > SETTLED_RPM) {
+      nearlyStopped = false;
+    }
+  }
+
+  if (insideTolerance && nearlyStopped) {
+    settledTimeMs += POSITION_PERIOD_US / 1000UL;
+    if (settledTimeMs >= SETTLED_TIME_MS) {
+      const uint32_t completedSequence = activeSequence;
+      stopMotors();
+      Serial.print(F("DONE "));
+      Serial.println(completedSequence);
+    }
+  } else {
+    settledTimeMs = 0;
   }
 }
 
-void pollSerial() {
-  while (Serial.available()) {
-    char c = (char)Serial.read();
-    if (c == '\n' || c == '\r') {
-      if (buflen) { buf[buflen] = '\0'; handleLine(buf); buflen = 0; }
-    } else if (buflen < sizeof(buf) - 1) {
-      buf[buflen++] = c;
+const __FlashStringHelper *modeName() {
+  switch (controlMode) {
+    case ControlMode::MANUAL: return F("MANUAL");
+    case ControlMode::POSITION: return F("POSITION");
+    default: return F("IDLE");
+  }
+}
+
+void printStatus() {
+  const float leftDegrees = static_cast<float>(readEncoder(0)) * 360.0f
+                          * MOTOR1_FORWARD_SIGN / ENCODER1_CPR;
+  const float rightDegrees = static_cast<float>(readEncoder(1)) * 360.0f
+                           * MOTOR2_FORWARD_SIGN / ENCODER2_CPR;
+  const float leftRpm = motors[0].measuredRpm * MOTOR1_FORWARD_SIGN;
+  const float rightRpm = motors[1].measuredRpm * MOTOR2_FORWARD_SIGN;
+
+  Serial.print(F("STATE "));
+  Serial.print(activeSequence);
+  Serial.print(' ');
+  Serial.print(modeName());
+  Serial.print(' ');
+  Serial.print(leftDegrees, 2);
+  Serial.print(' ');
+  Serial.print(rightDegrees, 2);
+  Serial.print(' ');
+  Serial.print(leftRpm, 2);
+  Serial.print(' ');
+  Serial.println(rightRpm, 2);
+}
+
+bool parseUnsigned(const char *text, uint32_t &value) {
+  if (text == nullptr || *text == '\0' || *text == '-') return false;
+  char *end = nullptr;
+  const unsigned long parsed = strtoul(text, &end, 10);
+  if (*end != '\0') return false;
+  value = parsed;
+  return true;
+}
+
+bool parseFloatValue(const char *text, float &value) {
+  if (text == nullptr || *text == '\0') return false;
+  char *end = nullptr;
+  value = static_cast<float>(strtod(text, &end));
+  return *end == '\0' && isfinite(value);
+}
+
+void processLine(char *line) {
+  char *command = strtok(line, " \t");
+  if (command == nullptr) return;
+
+  if (strcmp(command, "MOVE") == 0) {
+    char *sequenceText = strtok(nullptr, " \t");
+    char *leftText = strtok(nullptr, " \t");
+    char *rightText = strtok(nullptr, " \t");
+    char *rpmText = strtok(nullptr, " \t");
+    uint32_t sequence;
+    float leftDegrees;
+    float rightDegrees;
+    float maxRpm;
+    if (!parseUnsigned(sequenceText, sequence)
+        || !parseFloatValue(leftText, leftDegrees)
+        || !parseFloatValue(rightText, rightDegrees)
+        || !parseFloatValue(rpmText, maxRpm)
+        || strtok(nullptr, " \t") != nullptr
+        || maxRpm <= 0.0f) {
+      Serial.println(F("ERR BAD_MOVE"));
+      return;
+    }
+    beginPositionMove(sequence, leftDegrees, rightDegrees, maxRpm);
+    Serial.print(F("ACK "));
+    Serial.println(sequence);
+    return;
+  }
+
+  if (strcmp(command, "DRIVE") == 0) {
+    char *leftText = strtok(nullptr, " \t");
+    char *rightText = strtok(nullptr, " \t");
+    float leftRpm;
+    float rightRpm;
+    if (!parseFloatValue(leftText, leftRpm)
+        || !parseFloatValue(rightText, rightRpm)
+        || strtok(nullptr, " \t") != nullptr) {
+      Serial.println(F("ERR BAD_DRIVE"));
+      return;
+    }
+    driveVelocity(leftRpm, rightRpm);
+    return;
+  }
+
+  if (strcmp(command, "HB") == 0) {
+    lastLinkMs = millis();
+    return;
+  }
+
+  if (strcmp(command, "STOP") == 0) {
+    stopMotors();
+    lastLinkMs = millis();
+    Serial.println(F("STOPPED"));
+    return;
+  }
+
+  if (strcmp(command, "STATUS") == 0) {
+    lastLinkMs = millis();
+    printStatus();
+    return;
+  }
+
+  if (strcmp(command, "PING") == 0) {
+    lastLinkMs = millis();
+    Serial.println(F("PONG"));
+    return;
+  }
+
+  Serial.println(F("ERR BAD_COMMAND"));
+}
+
+void processManualKey(char key) {
+  switch (key) {
+    case 'w': driveVelocity( MANUAL_RPM,  MANUAL_RPM); break;
+    case 's': driveVelocity(-MANUAL_RPM, -MANUAL_RPM); break;
+    case 'a': driveVelocity(-MANUAL_RPM,  MANUAL_RPM); break;
+    case 'd': driveVelocity( MANUAL_RPM, -MANUAL_RPM); break;
+    case 'x':
+      stopMotors();
+      Serial.println(F("STOPPED"));
+      break;
+    case 'p': printStatus(); break;
+  }
+}
+
+void processSerial() {
+  while (Serial.available() > 0) {
+    const char input = static_cast<char>(Serial.read());
+
+    // Lower-case keys retain immediate WASD operation without a newline.
+    if (lineLength == 0 && strchr("wasdxp", input) != nullptr) {
+      processManualKey(input);
+      continue;
+    }
+
+    if (input == '\r' || input == '\n') {
+      if (lineLength > 0) {
+        lineBuffer[lineLength] = '\0';
+        processLine(lineBuffer);
+        lineLength = 0;
+      }
+      continue;
+    }
+
+    if (lineLength < sizeof(lineBuffer) - 1U) {
+      lineBuffer[lineLength++] = input;
+    } else {
+      lineLength = 0;
+      Serial.println(F("ERR LINE_TOO_LONG"));
     }
   }
 }
 
-// ---------------- 설정 / 루프 ----------------
 void setup() {
+  setupPwm20kHz();
+  stopMotors();
+
+  pinMode(ENCODER1_A_PIN, INPUT_PULLUP);
+  pinMode(ENCODER1_B_PIN, INPUT_PULLUP);
+  pinMode(ENCODER2_A_PIN, INPUT_PULLUP);
+  pinMode(ENCODER2_B_PIN, INPUT_PULLUP);
+  encoderPrevious[0] = static_cast<uint8_t>((digitalRead(ENCODER1_A_PIN) ? 1U : 0U)
+                                           | (digitalRead(ENCODER1_B_PIN) ? 2U : 0U));
+  encoderPrevious[1] = static_cast<uint8_t>((digitalRead(ENCODER2_A_PIN) ? 1U : 0U)
+                                           | (digitalRead(ENCODER2_B_PIN) ? 2U : 0U));
+  attachInterrupt(digitalPinToInterrupt(ENCODER1_A_PIN), encoder1AIsr, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCODER1_B_PIN), encoder1BIsr, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCODER2_A_PIN), encoder2AIsr, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCODER2_B_PIN), encoder2BIsr, CHANGE);
+
+  motors[0] = {{0.00060f, 0.00120f, 0.00001f, 0.0f, 0.0f, 0.0f},
+               0.0f, 0.0f, 0.0f, ENCODER1_CPR, readEncoder(0)};
+  motors[1] = {{0.00060f, 0.00120f, 0.00001f, 0.0f, 0.0f, 0.0f},
+               0.0f, 0.0f, 0.0f, ENCODER2_CPR, readEncoder(1)};
+
   Serial.begin(115200);
-  pinMode(PIN_L_PWM, OUTPUT); pinMode(PIN_L_DIR, OUTPUT);
-  pinMode(PIN_R_PWM, OUTPUT); pinMode(PIN_R_DIR, OUTPUT);
-  pinMode(PIN_ENC_L_A, INPUT_PULLUP); pinMode(PIN_ENC_L_B, INPUT_PULLUP);
-  pinMode(PIN_ENC_R_A, INPUT_PULLUP); pinMode(PIN_ENC_R_B, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(PIN_ENC_L_A), isrLeftA,  RISING);
-  attachInterrupt(digitalPinToInterrupt(PIN_ENC_R_A), isrRightA, RISING);
-  stopAll();
-  lastCmdMs = lastCtlMs = lastTelemMs = millis();
-  Serial.println(F("# agrix mega ready"));
+  Serial.println(F("READY MEGA_MOTION_V2"));
+  Serial.println(F("DRIVE left_rpm right_rpm | MOVE seq left_deg right_deg max_rpm"));
+  Serial.println(F("HB | STOP | STATUS | PING"));
+  nextControlUs = micros() + CONTROL_PERIOD_US;
+  nextPositionUs = micros() + POSITION_PERIOD_US;
+  nextTelemetryMs = millis() + TELEMETRY_PERIOD_MS;
+  lastLinkMs = millis();
 }
 
 void loop() {
-  pollSerial();
-  unsigned long now = millis();
+  processSerial();
 
-  // --- 워치독: 상위가 조용하면 스스로 멈춘다 ---
-  if (now - lastCmdMs > WATCHDOG_MS && !watchdogStopped) {
-    stopAll();
-    watchdogStopped = true;
+  const uint32_t nowUs = micros();
+  if (static_cast<int32_t>(nowUs - nextControlUs) >= 0) {
+    nextControlUs += CONTROL_PERIOD_US;
+    controlStep();
   }
 
-  // --- 속도 PID (100Hz) ---
-  if (now - lastCtlMs >= CONTROL_MS) {
-    float dt = (now - lastCtlMs) / 1000.0f;
-    lastCtlMs = now;
-    long l, r;
-    noInterrupts(); l = encL; r = encR; interrupts();
-    stepWheel(wl, l, dt, PIN_L_PWM, PIN_L_DIR);
-    stepWheel(wr, r, dt, PIN_R_PWM, PIN_R_DIR);
+  if (controlMode == ControlMode::POSITION
+      && static_cast<int32_t>(nowUs - nextPositionUs) >= 0) {
+    nextPositionUs += POSITION_PERIOD_US;
+    positionStep();
   }
 
-  // --- 텔레메트리 (20Hz) ---
-  if (now - lastTelemMs >= TELEM_MS) {
-    lastTelemMs = now;
-    long l, r;
-    noInterrupts(); l = encL; r = encR; interrupts();
-    Serial.print(F("T "));
-    Serial.print(wl.measured, 4); Serial.print(' ');
-    Serial.print(wr.measured, 4); Serial.print(' ');
-    Serial.print(l);              Serial.print(' ');
-    Serial.print(r);              Serial.print(' ');
-    Serial.print(wl.duty);        Serial.print(' ');
-    Serial.print(wr.duty);        Serial.print(' ');
-    Serial.println(watchdogStopped ? 1 : 0);
+  const uint32_t nowMs = millis();
+  if (static_cast<int32_t>(nowMs - nextTelemetryMs) >= 0) {
+    nextTelemetryMs += TELEMETRY_PERIOD_MS;
+    printStatus();
+  }
+
+  const uint32_t silenceMs = static_cast<uint32_t>(nowMs - lastLinkMs);
+  if (controlMode == ControlMode::MANUAL && silenceMs > DRIVE_TIMEOUT_MS) {
+    stopMotors();
+    Serial.println(F("ERR DRIVE_TIMEOUT"));
+  } else if (controlMode == ControlMode::POSITION && silenceMs > LINK_TIMEOUT_MS) {
+    const uint32_t stoppedSequence = activeSequence;
+    stopMotors();
+    Serial.print(F("ERR LINK_TIMEOUT "));
+    Serial.println(stoppedSequence);
   }
 }

@@ -91,7 +91,10 @@ class CCRDNetLineDetector:
                 str(path), sess_options=options, providers=["CPUExecutionProvider"]
             )
             self._input_name = self._session.get_inputs()[0].name
-            shape = self._session.get_inputs()[0].shape  # [1, 3, H, W]
+            shape = self._session.get_inputs()[0].shape  # [1, C, H, W]
+            self._input_channels = int(shape[1])
+            if self._input_channels not in (1, 3):
+                raise ValueError(f"unsupported CCRDNet input channels: {shape[1]}")
             self._input_hw = (int(shape[2]), int(shape[3]))
             self._thread = threading.Thread(
                 target=self._worker, name="ccrdnet-onnx", daemon=True
@@ -108,9 +111,16 @@ class CCRDNetLineDetector:
     def _lines(self, frame: np.ndarray):
         """Run the network; return (nav_band result, structure_mid result)."""
         h, w = self._input_hw
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        resized = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_LINEAR)
-        tensor = np.transpose(resized.astype(np.float32) / 255.0, (2, 0, 1))[None]
+        if self._input_channels == 1:
+            gray = (cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    if frame.ndim == 3 else frame)
+            resized = cv2.resize(gray, (w, h), interpolation=cv2.INTER_LINEAR)
+            tensor = (resized.astype(np.float32) / 255.0)[None, None]
+        else:
+            rgb = (cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if frame.ndim == 3
+                   else cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB))
+            resized = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_LINEAR)
+            tensor = np.transpose(resized.astype(np.float32) / 255.0, (2, 0, 1))[None]
         logits = self._session.run(None, {self._input_name: tensor})[0][0]
         shifted = logits - logits.max(axis=0, keepdims=True)
         exp = np.exp(shifted)

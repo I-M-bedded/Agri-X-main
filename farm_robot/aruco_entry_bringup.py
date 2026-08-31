@@ -13,7 +13,7 @@ import argparse
 import math
 import sys
 
-from actuators.motor_driver import MotorDriver
+from control.mega_motion import MegaMotion
 from navigation.aruco_entry_fsm import ArucoEntryConfig, ArucoEntryFSM
 from sensors.aruco_detector import ArucoDetector
 from sensors.camera import Camera
@@ -44,7 +44,7 @@ def main() -> int:
 
     camera = Camera()
     odom = Odometry()
-    motors = MotorDriver(odometry=odom)
+    motors = MegaMotion(odometry=odom)
     aruco = ArucoDetector(camera)
 
     turn_angle = math.pi / 2.0 if args.turn == "left" else -math.pi / 2.0

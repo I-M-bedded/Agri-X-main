@@ -60,7 +60,7 @@ def test_imports():
     section("1. 모듈 임포트")
     mods = [
         "logutil", "config",
-        "control.pid_controller", "control.line_follower",
+        "control.pid_controller", "control.line_follower", "control.mega_motion",
         "sensors.odometry", "sensors.tof_sensor", "sensors.camera",
         "sensors.aruco_detector", "sensors.vision_line_detector",
         "sensors.water_tank_sensor",

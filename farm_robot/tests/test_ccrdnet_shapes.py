@@ -29,6 +29,25 @@ class CCRDNetShapeTest(unittest.TestCase):
                     out = model(torch.zeros(1, 3, 256, 256))
                 self.assertEqual(tuple(out.shape), (1, 3, 256, 256))
 
+    def test_grayscale_model_runs_with_one_channel(self):
+        config = CCRDNetConfig(in_channels=1)
+        model = CCRDNet(config).eval()
+        with torch.no_grad():
+            out = model(torch.zeros(2, 1, 96, 128))
+        self.assertEqual(tuple(out.shape), (2, 3, 96, 128))
+        self.assertLess(count_parameters(model), count_parameters(CCRDNet()))
+
+    def test_replicated_grayscale_stem_accepts_rgb_checkpoint(self):
+        rgb = CCRDNet()
+        config = CCRDNetConfig(in_channels=1, replicate_grayscale_input=True)
+        gray = CCRDNet(config).eval()
+        gray.load_state_dict(rgb.state_dict())
+        with torch.no_grad():
+            x = torch.rand(1, 1, 64, 64)
+            gray_out = gray(x)
+            rgb_out = rgb.eval()(x.repeat(1, 3, 1, 1))
+        self.assertTrue(torch.equal(gray_out, rgb_out))
+
     def test_default_scale_matches_paper(self):
         model = CCRDNet()
         params = count_parameters(model)

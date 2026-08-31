@@ -109,7 +109,10 @@ def main():
         component_mode=args.component_mode, fit_mode=args.fit_mode
     )
 
-    dataset = CCRDDataset(args.data_root, args.split, config.input_size, augment=False)
+    dataset = CCRDDataset(
+        args.data_root, args.split, config.input_size, augment=False,
+        in_channels=config.in_channels,
+    )
     print(f"{args.split} frames: {len(dataset)}  device={device}")
 
     os.makedirs(os.path.join(args.out, "overlays"), exist_ok=True)
@@ -130,13 +133,22 @@ def main():
                 args.line_width, nav_probability=nav_prob,
             )
             frames.append(fm)
-            image_rgb = (tensor.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            image_chw = tensor.numpy()
+            if config.in_channels == 1:
+                image_rgb = np.repeat(image_chw, 3, axis=0).transpose(1, 2, 0)
+            else:
+                image_rgb = image_chw.transpose(1, 2, 0)
+            image_rgb = (image_rgb * 255).astype(np.uint8)
             per_frame_art[name] = (image_rgb, gt, pred, nav_prob)
 
     summary = summarize(frames)
     summary["checkpoint"] = os.path.abspath(args.checkpoint)
     summary["checkpoint_epoch"] = ckpt.get("epoch")
     summary["split"] = args.split
+    summary["input_channels"] = config.in_channels
+    summary["replicate_grayscale_input"] = config.replicate_grayscale_input
+    summary["component_mode"] = args.component_mode
+    summary["fit_mode"] = args.fit_mode
     with open(os.path.join(args.out, "metrics.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 

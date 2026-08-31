@@ -74,32 +74,31 @@ PID (와인드업 방지) → steer   (부호 규약: 양수 = 오른쪽 조향)
 
 ---
 
-## 3. 구동 계층 (모터 추상화)
+## 3. 구동 계층 (Mega Motion V2)
 
-상위(FSM/LineFollower)는 **무차원 명령만** 준다. 하위가 물리를 책임진다.
+상위(FSM/LineFollower)는 **무차원 명령만** 주고, `MegaMotion`이 출력축
+RPM 또는 상대 회전각으로 변환한다. 엔코더와 PID는 USB로 연결된 Mega가
+소유한다.
 
 ```text
-FSM / LineFollower       drive(base_speed, steer)     [-1, 1] 무차원
-        │                 ※ 상위는 듀티/전압/PWM 을 전혀 모른다
+FSM / LineFollower       drive(base_speed, steer)       [-1, 1]
+        │
         ▼
-ClosedLoopDrive          명령 → 목표 바퀴속도(m/s)
- (DRIVE_MODE=            → 엔코더 실측과 비교 → 피드포워드 + PI 보정
-  "closed_loop")         actuators/closed_loop_drive.py
+MegaMotion (Pi)          DRIVE left_rpm right_rpm       연속 주행
+control/mega_motion.py   MOVE seq left_deg right_deg    정밀 회전
+        │ USB CDC 115200
         ▼
-MotorDriver              듀티 · 방향핀 · 데드밴드 보상 · 회전 블로킹
-                         actuators/motor_driver.py
+Arduino Mega             1 kHz PID · 4체배 엔코더 · 20 kHz PWM
+agrix_motor_mega.ino     400 ms DRIVE watchdog
 ```
 
-- `DRIVE_MODE="open_loop"`(기본): 명령을 그대로 듀티로. 기존 동작.
-- `DRIVE_MODE="closed_loop"`: 같은 명령 = 항상 같은 속도. 배터리 전압이
-  떨어지거나 흙 저항이 커져도 속도가 유지되어 PID 튜닝과 거리 기반 로직이
-  안정된다. **엔코더가 죽으면 자동으로 피드포워드만 남는다**(= 개루프와 동일,
-  더 나빠지지 않는다).
-- 인터페이스가 `MotorDriver` 와 완전히 동일해서 FSM 은 어느 쪽인지 모른다.
-- 회전(`turn_by_angle_blocking` 등)은 검증된 `MotorDriver` 구현에 위임한다.
-
-**실측 필요**: `MAX_WHEEL_SPEED_MPS`(명령 1.0에 대응하는 실제 바퀴 속도).
-이 값이 틀리면 PI 가 계속 포화된다. `tools/setup.py` 2번으로 잰다.
+- `DRIVE`는 20 Hz 제어 틱마다 갱신한다. 별도 background heartbeat를 보내지
+  않으므로 Pi 제어 루프가 멎으면 Mega가 400 ms 안에 정지한다.
+- `MOVE`를 기다리는 동안에만 200 ms heartbeat를 보내며 `DONE seq`까지
+  블로킹한다. 90°/180° 회전은 이 경로를 사용한다.
+- `STATE`는 Mega가 20 Hz 자동 전송하고 Pi 오도메트리에 좌우 출력축 각도
+  증분을 주입한다.
+- `actuators/motor_driver.py`는 Gazebo/내부 시뮬레이션 전용으로 남겨 둔다.
 
 ---
 
@@ -187,15 +186,15 @@ ENCODER_GEAR_RATIO= 1.0   # ★ 모터축→바퀴축 감속비 실측 필요
 
 ---
 
-## 6. 전환 스위치 (전부 `config.py`, 기본값은 안전한 레거시 경로)
+## 6. 주요 설정 (`config.py`)
 
 ```python
 SEARCH_MODE       = "creep"      # "rotate" = 레거시 제자리 회전 탐색
 ODOMETRY_BACKEND  = "encoder"    # → "encoder_imu"
-DRIVE_MODE        = "open_loop"  # → "closed_loop"
+ODOMETRY_SOURCE   = "mega_usb"   # 실기 Mega STATE 사용
+MEGA_DRIVE_MAX_RPM = 80.0        # 상위 명령 1.0의 출력축 RPM
 WATER_SOURCE      = "gpio"       # → "nano_usb"
 VISION_BACKEND    = "hsv"        # → "ccrdnet"
-ENCODER_QUAD_PINS = None         # → 핀맵 dict (쿼드러처 활성)
 ```
 
 부호가 반대로 동작하면 **코드가 아니라** `SIGN_*` 를 뒤집는다
@@ -213,8 +212,8 @@ ENCODER_QUAD_PINS = None         # → 핀맵 dict (쿼드러처 활성)
 | 추론 비용 | 37.6 M MACs, ONNX 163 KB. PC CPU 3스레드 6.7 ms/frame |
 
 **핀맵 확정 후 실측할 것**
-1. `ENCODER_QUAD_PINS` 채우고 A/B 위상·부호 확인 (`tools/setup.py` 2번)
-2. `ENCODER_GEAR_RATIO`, `MAX_WHEEL_SPEED_MPS` 실측 → `closed_loop` 전환
+1. Mega의 A/B 위상과 `MOTOR*_FORWARD_SIGN` 확인 (`tools/setup.py` 2번)
+2. `MEGA_DRIVE_MAX_RPM`, PID 게인, 400 ms watchdog 정지 확인
 3. IMU 배선 후 `ODOMETRY_BACKEND="encoder_imu"`, 180° 회전 정밀도 재측정
 4. 비전 지연(mean/P95)·CPU·온도 벤치 → 통과 후에만 `VISION_BACKEND="ccrdnet"`
 5. `SEARCH_CREEP_MAX_DISTANCE_M` 을 실제 팻말 간격에 맞게 조정

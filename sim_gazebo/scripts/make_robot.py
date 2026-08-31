@@ -66,57 +66,84 @@ def main():
     iyy = MASS_KG * (BODY_L**2 + HULL_H**2) / 12.0
     izz = MASS_KG * (BODY_L**2 + BODY_W**2) / 12.0
 
-    def box_part(name, sx, sy, sz, px, py, pz, rgb, mu=None):
-        # [수정] 트랙 판은 지면에 닿아 있다(바닥 z=0~0.08). 기본 마찰이면
-        #   **브레이크처럼 끌려** 명령한 각속도의 1/4 밖에 돌지 않는다
-        #   (실측: 명령 -98도 회전 -> 실제 -25도).
-        #   실제 무한궤도의 접지면은 '구르는' 접촉이므로 마찰을 낮춰 근사한다.
-        surf = "" if mu is None else (
-            f"<surface><friction><ode><mu>{mu}</mu><mu2>{mu}</mu2>"
-            f"</ode></friction></surface>")
-        return f'''
+    def box_part(name, sx, sy, sz, px, py, pz, rgb, collide=True):
+        # [수정] 트랙 판은 **시각용**으로만 둔다(충돌 없음).
+        #   지면에 닿게 두면 하중을 바퀴와 나눠 받아 바퀴가 헛돌고,
+        #   엔코더 오도메트리가 실제 이동의 4~5배를 보고했다
+        #   (실측: 명령 -86도 회전 -> 실제 -21도, 전진 1.05m -> 실제 0.22m).
+        #   지면에서 띄우면 이번엔 헐 모서리가 박혀 아예 못 간다.
+        #   -> 접지는 바퀴 2개 + 무마찰 캐스터 2개로 정리한다.
+        col = "" if not collide else f'''
       <collision name="col_{name}">
         <pose>{px:.3f} {py:.3f} {pz:.3f} 0 0 0</pose>
         <geometry><box><size>{sx:.3f} {sy:.3f} {sz:.3f}</size></box></geometry>
-        {surf}
-      </collision>
+      </collision>'''
+        return col + f'''
       <visual name="vis_{name}">
         <pose>{px:.3f} {py:.3f} {pz:.3f} 0 0 0</pose>
         <geometry><box><size>{sx:.3f} {sy:.3f} {sz:.3f}</size></box></geometry>
         <material><ambient>{rgb} 1</ambient><diffuse>{rgb} 1</diffuse></material>
       </visual>'''
 
+    def caster(name, px, r=0.02, lift=0.006):
+        """앞뒤 피치를 막는 무마찰 받침. 견인력은 전부 바퀴가 낸다.
+
+        [수정] 캐스터 바닥을 바퀴와 같은 높이(z=0)에 두면 하중이 캐스터로
+          몰려 바퀴가 헛돈다(실측: 바퀴 1.06m 회전에 실제 이동 0.35m).
+          6mm 띄워 평지에서는 **바퀴만 접지**하게 한다.
+        """
+        return f'''
+      <collision name="col_{name}">
+        <pose>{px:.3f} 0 {r + lift - HULL_Z:.4f} 0 0 0</pose>
+        <geometry><sphere><radius>{r:.3f}</radius></sphere></geometry>
+        <surface><friction><ode><mu>0.0</mu><mu2>0.0</mu2></ode></friction>
+          <bounce><restitution_coefficient>0</restitution_coefficient></bounce></surface>
+      </collision>'''
+
     # base_link 원점은 **헐 중심**(지면에서 HULL_Z). 나머지는 그 기준 상대좌표.
     parts = box_part("hull", BODY_L, BODY_W, HULL_H, 0, 0, 0, "0.20 0.35 0.50")
     for sgn, nm in ((1, "l"), (-1, "r")):
         parts += box_part(f"track_{nm}", BODY_L, 0.03, 0.08,
                           0, sgn * (BODY_W / 2 + 0.015), -HULL_H / 2 + 0.02,
-                          "0.10 0.10 0.12", mu=0.05)
+                          "0.10 0.10 0.12", collide=False)
     parts += box_part("mast", 0.08, 0.08, MAST_H, 0, 0,
                       MAST_Z - HULL_Z, "0.30 0.30 0.34")
+    parts += caster("caster_f", BODY_L / 2 - 0.03)
+    parts += caster("caster_r", -(BODY_L / 2 - 0.03))
 
     def wheel(name, y):
+        """바퀴 링크. **링크 자체는 회전시키지 않는다.**
+
+        [수정] 예전에는 링크를 roll +90도로 눕히고 조인트 축을 (0,-1,0) 으로
+          줬는데, SDF 에서 축은 기본적으로 **자식 링크 프레임** 기준이라
+          눕힌 링크에서 (0,-1,0) 은 결국 **연직축**을 가리켰다.
+          그 결과 바퀴는 돌지만 차체는 제자리에서 옆으로 미끄러지기만 했다
+          (실측: 오도메트리 3.45m 전진 보고, 실제 y 변화 0.00m).
+          링크를 세워두면 축 (0,1,0) 이 그대로 좌우축이라 모호함이 없다.
+          충돌은 구, 보이는 것만 원통으로 눕힌다.
+        """
         return f'''
     <link name="{name}">
-      <pose>0 {y:.4f} {rad:.4f} {math.pi/2:.4f} 0 0</pose>
+      <pose>0 {y:.4f} {rad:.4f} 0 0 0</pose>
       <inertial><mass>0.4</mass>
         <inertia><ixx>0.001</ixx><iyy>0.001</iyy><izz>0.001</izz>
           <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
       <collision name="c">
-        <geometry><cylinder><radius>{rad:.4f}</radius><length>0.05</length></cylinder></geometry>
-        <surface><friction><ode><mu>1.2</mu><mu2>1.0</mu2></ode></friction></surface>
+        <geometry><sphere><radius>{rad:.4f}</radius></sphere></geometry>
+        <surface><friction><ode><mu>2.0</mu><mu2>2.0</mu2>
+          <slip1>0.0</slip1><slip2>0.0</slip2></ode></friction>
+          <contact><ode><kp>1e6</kp><kd>100</kd></ode></contact></surface>
       </collision>
       <visual name="v">
+        <pose>0 0 0 {math.pi/2:.4f} 0 0</pose>
         <geometry><cylinder><radius>{rad:.4f}</radius><length>0.05</length></cylinder></geometry>
         <material><ambient>0.05 0.05 0.05 1</ambient><diffuse>0.1 0.1 0.1 1</diffuse></material>
       </visual>
     </link>
     <joint name="{name}_joint" type="revolute">
       <parent>base_link</parent><child>{name}</child>
-      <!-- [수정] 바퀴 실린더를 roll +pi/2 로 눕혔으므로 조인트 축은 -y 여야
-           전진 명령(linear.x>0)에 실제로 전진한다. +y 로 두면 **후진**한다
-           (실측: 전진 명령에 월드 y 가 -1.1 -> -5.49 로 뒤로 갔다). -->
-      <axis><xyz>0 -1 0</xyz><limit><lower>-1e16</lower><upper>1e16</upper></limit></axis>
+      <axis><xyz expressed_in="__model__">0 1 0</xyz>
+        <limit><lower>-1e16</lower><upper>1e16</upper></limit></axis>
     </joint>'''
 
     def tof(name, sgn):

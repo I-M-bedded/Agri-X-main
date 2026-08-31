@@ -187,7 +187,7 @@ def check_sensors() -> int:
 # 2) 모터·부호 벤치 점검 - 바퀴가 실제로 돈다
 # ======================================================================
 def check_motors() -> int:
-    from actuators.motor_driver import MotorDriver
+    from control.mega_motion import MegaMotion
     from actuators.pump_controller import PumpController
     from sensors.odometry import Odometry
 
@@ -200,7 +200,7 @@ def check_motors() -> int:
         return 1
 
     odom = Odometry()
-    motors = MotorDriver(odometry=odom)
+    motors = MegaMotion(odometry=odom)
     problems = []
 
     try:
@@ -441,7 +441,7 @@ def calibrate_tracks() -> int:
     이 두 오차는 흙 상태에 따라 달라져 계산으로 못 구한다. 재는 수밖에 없다.
     이 도구가 로봇을 움직여 주고, 사용자는 자로 재서 숫자만 입력하면 된다.
     """
-    from actuators.motor_driver import MotorDriver
+    from control.mega_motion import MegaMotion
     from sensors.odometry import Odometry
 
     print("\n" + "!" * 64)
@@ -455,7 +455,7 @@ def calibrate_tracks() -> int:
         return 1
 
     odom = Odometry()
-    motors = MotorDriver(odometry=odom)
+    motors = MegaMotion(odometry=odom)
     results = {}
 
     try:

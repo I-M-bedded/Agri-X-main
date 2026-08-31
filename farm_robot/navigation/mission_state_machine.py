@@ -301,7 +301,13 @@ class MissionStateMachine:
             )
 
         if hasattr(self.odom, "is_available") and not self.odom.is_available():
-            problems.append("엔코더 GPIO 초기화에 실패했습니다.")
+            problems.append("오도메트리 입력 초기화에 실패했습니다.")
+
+        if hasattr(self.motors, "available") and not self.motors.available:
+            problems.append(
+                "Arduino Mega Motion USB 연결에 실패했습니다: "
+                + str(getattr(self.motors, "last_error", "원인 불명"))
+            )
 
         from config import VISION_BACKEND
         if (
@@ -338,10 +344,9 @@ class MissionStateMachine:
         return create_odometry()
 
     def _make_motors(self):
-        # DRIVE_MODE: "open_loop" | "closed_loop" (config 13-2 참고)
-        from actuators.closed_loop_drive import create_drive
+        from control.mega_motion import MegaMotion
 
-        return create_drive(odometry=self.odom)
+        return MegaMotion(odometry=self.odom)
 
     def _make_pump(self):
         from actuators.pump_controller import PumpController
@@ -558,15 +563,23 @@ class MissionStateMachine:
         self._tick += 1
 
         try:
+            if (
+                not self._injected
+                and self._tick > 10
+                and hasattr(self.motors, "link_ok")
+                and not self.motors.link_ok()
+            ):
+                self._safe_halt(
+                    "Arduino Mega Motion STATE가 0.5초 이상 끊겼습니다. "
+                    "USB 케이블과 /dev/ttyACM 장치를 확인하십시오."
+                )
+                return
+
             # 매 틱 정확히 1회 - 위치 추정과 센서 폴링은 여기서만
             self.odom.update()
             self.water_sensor.poll()
-            # [필수] 하위 제어기(아두이노 메가)는 400ms 무명령이면 스스로 멈춘다.
-            #   정지 중에도 매 틱 재전송해야 '연결 살아있음'과 '정지 명령'을
-            #   구분할 수 있다. 다른 구동 계층에는 이 메서드가 없으므로 선택 호출.
-            keepalive = getattr(self.motors, "keepalive", None)
-            if keepalive is not None:
-                keepalive()
+            # No background keepalive in DRIVE mode: if this 20 Hz loop stalls,
+            # the Mega's 400 ms command watchdog must stop the wheels.
             self.pump.tick()
 
             handler = {
