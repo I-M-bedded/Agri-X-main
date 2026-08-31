@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
-"""Direct Raspberry Pi keyboard bridge to the Mega firmware's WASD interface.
+"""Interactive Raspberry Pi WASD jog controller for the Mega motion firmware.
 
-This intentionally uses the exact same single-byte commands as Arduino Serial
-Monitor: w/a/s/d/x/p. It is a hardware bring-up tool, not the navigation stack.
+This bring-up tool talks to the same USB serial interface as Arduino Serial
+Monitor, but uses the firmware's target-speed command instead of fixed raw WASD
+speed:
 
-The active motion byte is refreshed periodically so the Mega's 400 ms DRIVE
-watchdog stays alive while a key is held/repeated. If keyboard input stops,
-the Pi sends x after the dead-man timeout. The Mega watchdog remains the final
-independent safety layer if this process or USB link dies.
+    DRIVE <left_rpm> <right_rpm>
+
+The default straight-line target is deliberately moderate (40 RPM): high enough
+to avoid the sluggish 20 RPM bring-up setting, while remaining well below the
+80 RPM raw-manual command used by the firmware's single-byte WASD interface.
+In-place turns use 80% of the straight target to reduce track scrub/current.
+
+The active DRIVE command is refreshed every 100 ms. If terminal key-repeat
+stops, this tool sends STOP after the dead-man interval; the Mega's independent
+400 ms DRIVE watchdog remains the final safety layer if the Pi process or USB
+link stalls.
 """
 
 from __future__ import annotations
@@ -33,7 +41,12 @@ from config import (  # noqa: E402
 
 
 REFRESH_SEC = 0.10
-DEFAULT_DEADMAN_SEC = 0.70
+DEFAULT_RPM = 40.0
+DEFAULT_TURN_SCALE = 0.80
+DEFAULT_DEADMAN_SEC = 0.55
+RPM_STEP = 5.0
+MIN_RPM = 10.0
+MAX_RPM = 80.0
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -60,20 +73,43 @@ def find_serial_port() -> str:
     raise RuntimeError("Mega serial port not found (/dev/ttyACM* or /dev/ttyUSB*)")
 
 
-def print_help() -> None:
+def print_help(rpm: float, turn_scale: float) -> None:
     print(
         "\nControls: W forward | S reverse | A left | D right | "
-        "X/Space stop | P state | Q quit"
+        "X/Space stop | P state | +/- speed | Q quit"
     )
     print(
-        "Commands are the same raw bytes used by Arduino Serial Monitor. "
-        "Motion speed is firmware MANUAL_RPM.\n"
+        f"Straight={rpm:.0f} RPM, turn={rpm * turn_scale:.0f} RPM. "
+        f"+/- changes straight target by {RPM_STEP:.0f} RPM.\n"
     )
 
 
-def write_key(ser, key: str) -> None:
-    ser.write(key.encode("ascii"))
+def write_line(ser, line: str) -> None:
+    ser.write((line + "\n").encode("ascii"))
     ser.flush()
+
+
+def send_stop(ser) -> None:
+    write_line(ser, "STOP")
+
+
+def command_for_key(key: str, rpm: float, turn_scale: float) -> tuple[float, float]:
+    turn_rpm = rpm * turn_scale
+    if key == "w":
+        return rpm, rpm
+    if key == "s":
+        return -rpm, -rpm
+    if key == "a":
+        return -turn_rpm, turn_rpm
+    if key == "d":
+        return turn_rpm, -turn_rpm
+    raise ValueError(f"unsupported motion key: {key}")
+
+
+def send_drive(ser, key: str, rpm: float, turn_scale: float) -> tuple[float, float]:
+    left, right = command_for_key(key, rpm, turn_scale)
+    write_line(ser, f"DRIVE {left:.3f} {right:.3f}")
+    return left, right
 
 
 def drain_lines(ser, rx_buffer: bytearray) -> list[str]:
@@ -92,11 +128,12 @@ def drain_lines(ser, rx_buffer: bytearray) -> list[str]:
 
 
 def verify_link(ser, timeout: float = 1.0) -> tuple[bool, list[str], bytearray]:
-    """Ask for state using raw 'p' and confirm that the Mega answers."""
+    """Request one STATE line and confirm Pi <-> Mega communication."""
     rx_buffer = bytearray()
     seen: list[str] = []
 
-    write_key(ser, "p")
+    ser.reset_input_buffer()
+    write_line(ser, "STATUS")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         for line in drain_lines(ser, rx_buffer):
@@ -109,7 +146,7 @@ def verify_link(ser, timeout: float = 1.0) -> tuple[bool, list[str], bytearray]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Raw Serial-Monitor-equivalent WASD test for Agri-X Mega"
+        description="Target-RPM WASD jog test for Raspberry Pi -> Agri-X Mega"
     )
     parser.add_argument(
         "--port",
@@ -123,10 +160,22 @@ def main() -> int:
         help=f"serial baud rate (default: {SERIAL_MEGA_BAUD})",
     )
     parser.add_argument(
+        "--rpm",
+        type=float,
+        default=DEFAULT_RPM,
+        help=f"initial straight target RPM ({MIN_RPM:.0f}..{MAX_RPM:.0f}, default: {DEFAULT_RPM:.0f})",
+    )
+    parser.add_argument(
+        "--turn-scale",
+        type=float,
+        default=DEFAULT_TURN_SCALE,
+        help="in-place turn RPM / straight RPM (default: 0.80)",
+    )
+    parser.add_argument(
         "--deadman",
         type=float,
         default=DEFAULT_DEADMAN_SEC,
-        help="seconds without a motion key before raw 'x' STOP (default: 0.70)",
+        help="seconds without a repeated motion key before STOP (default: 0.55)",
     )
     parser.add_argument(
         "--reset-delay",
@@ -155,7 +204,9 @@ def main() -> int:
         print(f"Serial device detection failed: {exc}", file=sys.stderr)
         return 1
 
-    deadman = clamp(args.deadman, 0.20, 2.00)
+    rpm = clamp(args.rpm, MIN_RPM, MAX_RPM)
+    turn_scale = clamp(args.turn_scale, 0.40, 1.00)
+    deadman = clamp(args.deadman, 0.35, 1.00)
 
     try:
         ser = serial.Serial(
@@ -188,16 +239,17 @@ def main() -> int:
                 print(f"Mega: {line}")
 
         if not ok:
-            print("Mega did not return STATE after raw 'p'.", file=sys.stderr)
+            print("Mega did not return STATE after STATUS.", file=sys.stderr)
             print(
-                "This means the Pi serial path itself is not matching the working "
-                "Serial Monitor path. Try --port explicitly and verify baud=115200.",
+                "Try --port explicitly and verify that the working serial monitor "
+                "uses the same device and 115200 baud.",
                 file=sys.stderr,
             )
             return 1
 
-        print("Mega raw serial link verified (received STATE).")
-        print_help()
+        print("Mega serial link verified (received STATE).")
+        print(f"refresh={REFRESH_SEC:.2f}s, deadman={deadman:.2f}s")
+        print_help(rpm, turn_scale)
 
         active_key: str | None = None
         command_deadline = 0.0
@@ -216,31 +268,51 @@ def main() -> int:
                 if key in "wasd":
                     active_key = key
                     command_deadline = now + deadman
-                    next_refresh = 0.0
+                    left, right = send_drive(ser, active_key, rpm, turn_scale)
+                    next_refresh = now + REFRESH_SEC
+                    print(
+                        f"\rDRIVE L={left:+.0f} R={right:+.0f} RPM            ",
+                        end="",
+                        flush=True,
+                    )
                 elif key in ("x", " "):
                     active_key = None
                     command_deadline = 0.0
-                    write_key(ser, "x")
-                    print("\rSTOP                              ", end="", flush=True)
+                    send_stop(ser)
+                    print("\rSTOP                                      ", end="", flush=True)
                 elif key == "p":
                     show_next_state = True
-                    write_key(ser, "p")
+                    write_line(ser, "STATUS")
+                elif key in ("+", "="):
+                    rpm = clamp(rpm + RPM_STEP, MIN_RPM, MAX_RPM)
+                    print(
+                        f"\rtarget={rpm:.0f} RPM, turn={rpm * turn_scale:.0f} RPM       ",
+                        end="",
+                        flush=True,
+                    )
+                elif key in ("-", "_"):
+                    rpm = clamp(rpm - RPM_STEP, MIN_RPM, MAX_RPM)
+                    print(
+                        f"\rtarget={rpm:.0f} RPM, turn={rpm * turn_scale:.0f} RPM       ",
+                        end="",
+                        flush=True,
+                    )
                 elif key == "q":
                     break
                 elif key == "h":
-                    print_help()
+                    print_help(rpm, turn_scale)
 
             now = time.monotonic()
             if active_key is not None:
                 if now >= command_deadline:
                     active_key = None
-                    write_key(ser, "x")
-                    print("\rDEADMAN STOP                       ", end="", flush=True)
+                    send_stop(ser)
+                    print("\rDEADMAN STOP                               ", end="", flush=True)
                 elif now >= next_refresh:
-                    write_key(ser, active_key)
+                    left, right = send_drive(ser, active_key, rpm, turn_scale)
                     next_refresh = now + REFRESH_SEC
                     print(
-                        f"\rTX raw '{active_key}' every {REFRESH_SEC:.2f}s   ",
+                        f"\rDRIVE L={left:+.0f} R={right:+.0f} RPM            ",
                         end="",
                         flush=True,
                     )
@@ -249,7 +321,7 @@ def main() -> int:
                 if line.startswith("ERR "):
                     print(f"\nMega: {line}", file=sys.stderr)
                 elif line == "STOPPED":
-                    print("\rMega: STOPPED                      ", end="", flush=True)
+                    print("\rMega: STOPPED                              ", end="", flush=True)
                 elif show_next_state and line.startswith("STATE "):
                     print(f"\nMega: {line}")
                     show_next_state = False
@@ -263,7 +335,7 @@ def main() -> int:
         try:
             if ser.is_open:
                 try:
-                    write_key(ser, "x")
+                    send_stop(ser)
                 except Exception:
                     pass
                 ser.close()
