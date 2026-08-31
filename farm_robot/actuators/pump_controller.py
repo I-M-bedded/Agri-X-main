@@ -8,9 +8,9 @@ actuators/pump_controller.py
   - physical pin 22 = BCM GPIO25 -> LR7843 SIG
   - physical pin 20 = GND        -> LR7843 GND
 
-현재 제어는 디지털 ON/OFF이며 HIGH = ON(100%), LOW = OFF이다.
-펌프는 전압이 인가되는 순간 바로 작동하므로 "고랑 밖에서는 절대 켜지지
-않도록" 소프트웨어 인터록을 강제한다.
+현재 펌프 ON 출력은 GPIO25 software PWM 1 kHz, duty 60%이다.
+LOW / 0% duty = OFF이며, 펌프는 전압이 인가되는 순간 바로 작동하므로
+"고랑 밖에서는 절대 켜지지 않도록" 소프트웨어 인터록을 강제한다.
 
 안전 기능
   1) tick()이 매 제어 주기마다 MOSFET 출력 상태를 다시 확정한다.
@@ -27,7 +27,8 @@ log = get_logger("pump")
 
 # RPi.GPIO uses BCM numbering. Physical pin 22 on the 40-pin header is BCM25.
 PUMP_MOSFET_PIN = 25
-PUMP_MOSFET_ACTIVE_HIGH = True
+PUMP_PWM_FREQUENCY_HZ = 1000
+PUMP_OUTPUT_DUTY_PERCENT = 60.0
 
 try:
     import RPi.GPIO as GPIO
@@ -39,27 +40,32 @@ except ImportError:
 
 class PumpController:
     def __init__(self):
-        self._in_furrow = False        # 안전 게이트: 지금 고랑 안인가
-        self._requested_on = False     # 상위 로직이 켜기를 원하는가
-        self._locked_out = False       # 물 부족 등으로 잠금
+        self._in_furrow = False
+        self._requested_on = False
+        self._locked_out = False
         self._output_state = False
         self._on_since = None
         self._gpio_ready = False
+        self._pwm = None
 
         if _HAS_GPIO:
             try:
                 GPIO.setwarnings(GPIO_WARNINGS)
                 GPIO.setmode(GPIO.BCM)
-                # LR7843 is active-high. Explicit LOW initialization prevents
-                # a startup pulse from briefly turning the pump on.
-                off_level = GPIO.LOW if PUMP_MOSFET_ACTIVE_HIGH else GPIO.HIGH
-                GPIO.setup(PUMP_MOSFET_PIN, GPIO.OUT, initial=off_level)
+                GPIO.setup(PUMP_MOSFET_PIN, GPIO.OUT, initial=GPIO.LOW)
+                self._pwm = GPIO.PWM(PUMP_MOSFET_PIN, PUMP_PWM_FREQUENCY_HZ)
+                self._pwm.start(0.0)
                 self._gpio_ready = True
             except Exception as exc:
-                log.error("펌프 MOSFET GPIO 초기화 실패: %s", exc)
+                log.error("펌프 MOSFET PWM 초기화 실패: %s", exc)
+                try:
+                    if self._pwm is not None:
+                        self._pwm.stop()
+                except Exception:
+                    pass
+                self._pwm = None
         self._apply_output(False)
 
-    # ------------------------------------------------------------------
     def _apply_output(self, on: bool):
         self._output_state = bool(on)
         if on:
@@ -68,21 +74,18 @@ class PumpController:
         else:
             self._on_since = None
 
-        if not self._gpio_ready:
+        if not self._gpio_ready or self._pwm is None:
             return
-        level = GPIO.HIGH if (on == PUMP_MOSFET_ACTIVE_HIGH) else GPIO.LOW
-        GPIO.output(PUMP_MOSFET_PIN, level)
+        self._pwm.ChangeDutyCycle(PUMP_OUTPUT_DUTY_PERCENT if on else 0.0)
 
     def _desired_state(self) -> bool:
         return self._requested_on and self._in_furrow and not self._locked_out
 
-    # ------------------------------------------------------------------
     def set_zone(self, in_furrow: bool):
         """상위 내비게이션이 '지금 고랑 안/밖'을 알려줄 때 호출."""
         changed = self._in_furrow != bool(in_furrow)
         self._in_furrow = bool(in_furrow)
         if not self._in_furrow:
-            # 고랑을 벗어나는 순간 요청 자체를 취소하고 즉시 OFF
             self._requested_on = False
         if changed:
             log.debug("펌프 zone -> %s", "고랑 안" if in_furrow else "고랑 밖")
@@ -96,7 +99,7 @@ class PumpController:
         self._apply_output(self._desired_state())
 
     def turn_on(self) -> bool:
-        """펌프 ON(100%) 요청. 실제로 켜졌으면 True를 반환한다."""
+        """펌프 ON(60% PWM) 요청. 실제로 켜졌으면 True를 반환한다."""
         self._requested_on = True
         desired = self._desired_state()
         self._apply_output(desired)
@@ -110,7 +113,7 @@ class PumpController:
         self._apply_output(False)
 
     def tick(self):
-        """MOSFET 출력을 재확정하고 최대 연속 가동 시간을 감시한다."""
+        """MOSFET PWM 출력을 재확정하고 최대 연속 가동 시간을 감시한다."""
         desired = self._desired_state()
 
         if (
@@ -133,8 +136,17 @@ class PumpController:
     def is_on(self) -> bool:
         return self._output_state
 
+    def output_percent(self) -> float:
+        return PUMP_OUTPUT_DUTY_PERCENT if self._output_state else 0.0
+
     def cleanup(self):
         self.turn_off()
+        if self._pwm is not None:
+            try:
+                self._pwm.stop()
+            except Exception:
+                pass
+            self._pwm = None
         if self._gpio_ready:
             try:
                 GPIO.cleanup(PUMP_MOSFET_PIN)

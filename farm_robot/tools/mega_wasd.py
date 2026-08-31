@@ -10,11 +10,10 @@ from OS key-repeat events. The first key press starts at a moderate RPM; repeate
 same-direction events increase the target linearly toward the configured maximum.
 The target never ramps by itself after key repeats stop.
 
-Space toggles the existing MOSFET-based ``PumpController``. With the current
-LR7843 path, ON means full output (100%); there is no PWM percentage control in
-this bring-up tool. The manual test explicitly opens the pump zone interlock while
-it is running, but retains the pump continuous-run watchdog and always turns the
-pump off during cleanup.
+A/D use equal-and-opposite wheel targets for a true in-place pivot. Space toggles
+the LR7843 MOSFET-based ``PumpController``; ON drives the pump at 60% PWM duty.
+The manual test explicitly opens the pump zone interlock while it is running, but
+retains the pump continuous-run watchdog and always turns the pump off on cleanup.
 """
 
 from __future__ import annotations
@@ -39,7 +38,7 @@ REFRESH_SEC = 0.10
 DEFAULT_START_RPM = 60.0
 DEFAULT_MAX_RPM = 120.0
 DEFAULT_RAMP_SEC = 1.20
-DEFAULT_TURN_SCALE = 0.85
+DEFAULT_TURN_SCALE = 1.00
 INITIAL_REPEAT_GRACE_SEC = 0.70
 RELEASE_DEADMAN_SEC = 0.25
 MAX_TEST_RPM = 145.0  # firmware clamps at 150 RPM; retain a little margin
@@ -72,18 +71,18 @@ def wheel_targets(key: str, rpm: float, turn_scale: float) -> tuple[float, float
 
 def print_help(start_rpm: float, max_rpm: float, ramp_sec: float, turn_scale: float) -> None:
     print(
-        "\nControls: W forward | S reverse | A left | D right | "
+        "\nControls: W forward | S reverse | A left pivot | D right pivot | "
         "X motor stop | Space pump ON/OFF | P state | +/- max RPM | Q quit"
     )
     print(
         f"Hold/repeat: {start_rpm:.0f} -> {max_rpm:.0f} RPM over {ramp_sec:.1f}s; "
-        f"turn scale={turn_scale:.2f}."
+        f"pivot scale={turn_scale:.2f}."
     )
     print(
         f"First-repeat grace={INITIAL_REPEAT_GRACE_SEC:.2f}s, "
         f"release stop={RELEASE_DEADMAN_SEC:.2f}s after repeats begin."
     )
-    print("Pump: LR7843 MOSFET output, Space toggles OFF <-> ON (100%).\n")
+    print("Pump: LR7843 MOSFET, Space toggles OFF <-> ON (60% PWM).\n")
 
 
 def print_state(motion: MegaMotion, pump: PumpController) -> None:
@@ -94,7 +93,7 @@ def print_state(motion: MegaMotion, pump: PumpController) -> None:
         f"\nSTATE mode={state.mode} "
         f"L={state.left_rpm:+.1f}rpm R={state.right_rpm:+.1f}rpm "
         f"Ldeg={state.left_degrees:+.1f} Rdeg={state.right_degrees:+.1f} "
-        f"pump={'ON(100%)' if pump.is_on() else 'OFF'}"
+        f"pump={pump.output_percent():.0f}%"
     )
 
 
@@ -105,11 +104,11 @@ def toggle_pump(pump: PumpController) -> None:
         return
 
     if not getattr(pump, "_gpio_ready", False):
-        print("\nPUMP unavailable: GPIO initialization failed", file=sys.stderr)
+        print("\nPUMP unavailable: GPIO/PWM initialization failed", file=sys.stderr)
         return
 
     if pump.turn_on():
-        print("\nPUMP ON (100%)")
+        print(f"\nPUMP ON ({pump.output_percent():.0f}% PWM)")
     else:
         print("\nPUMP ON blocked by PumpController interlock", file=sys.stderr)
 
@@ -161,8 +160,8 @@ def main() -> int:
         return 1
 
     pump = PumpController()
-    # This is an explicit manual hardware bring-up tool. Autonomous driving
-    # continues to control the real in-furrow zone interlock separately.
+    # Explicit manual hardware bring-up: autonomous navigation controls this
+    # interlock itself; the test tool opens it so Space can exercise the pump.
     pump.set_zone(True)
     pump.turn_off()
 
@@ -180,9 +179,9 @@ def main() -> int:
         print("MegaMotion abstraction connected.")
         print(f"refresh={REFRESH_SEC:.2f}s; firmware DRIVE watchdog remains active")
         if getattr(pump, "_gpio_ready", False):
-            print("PumpController GPIO ready; Space toggles LR7843 MOSFET at 100% output")
+            print("PumpController PWM ready; Space toggles LR7843 at 60% duty")
         else:
-            print("WARNING: PumpController GPIO is not ready; Space cannot drive the pump")
+            print("WARNING: PumpController GPIO/PWM is not ready; Space cannot drive the pump")
         print_help(start_rpm, max_rpm, ramp_sec, turn_scale)
         tty.setcbreak(fd)
 
@@ -223,7 +222,7 @@ def main() -> int:
                     print(
                         f"\rDRIVE L={left:+.0f} R={right:+.0f} RPM "
                         f"hold={now - held_since:.2f}s "
-                        f"pump={'ON' if pump.is_on() else 'OFF'}          ",
+                        f"pump={pump.output_percent():.0f}%          ",
                         end="",
                         flush=True,
                     )
@@ -268,8 +267,6 @@ def main() -> int:
                         raise RuntimeError(motion.last_error or "failed to refresh DRIVE")
                     next_refresh = now + REFRESH_SEC
 
-            # Keep PumpController's maximum-continuous-run watchdog active even
-            # while this manual teleop loop is otherwise idle.
             pump.tick()
 
             if motion.faulted:
