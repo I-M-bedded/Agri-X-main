@@ -1,0 +1,45 @@
+{
+  "frames_total": 430,
+  "frames_with_gt_line": 430,
+  "frames_with_pred_line": 430,
+  "detection_rate": 1.0,
+  "angle_error_deg": {
+    "mean": 10.53922642063312,
+    "median": 8.00104134456726,
+    "p95": 29.336200069432778,
+    "n": 430
+  },
+  "lateral_near_px": {
+    "mean": 34.03941643618116,
+    "median": 25.709966146439875,
+    "p95": 100.07791703195807,
+    "n": 430
+  },
+  "lateral_far_px": {
+    "mean": 23.58327416354333,
+    "median": 19.318132403485507,
+    "p95": 63.56033388441534,
+    "n": 430
+  },
+  "line_iou": {
+    "mean": 0.09720028695044762,
+    "median": 0.038205502174102825,
+    "p95": 0.4889517815545312,
+    "n": 430
+  },
+  "nav_mask_iou": {
+    "mean": 0.2936964890914224,
+    "median": 0.3084178981117387,
+    "p95": 0.47695009987678144,
+    "n": 430
+  },
+  "line_accuracy": 0.2186046511627907,
+  "accuracy_criterion": "AE<=5.0deg AND lateral_near<=10.0px",
+  "checkpoint": "C:\\Users\\JUN\\Documents\\Agri-X-main\\runs\\crdld_furrow_gray_rgbstem_ft_v1\\best.pt",
+  "checkpoint_epoch": 27,
+  "split": "test",
+  "input_channels": 1,
+  "replicate_grayscale_input": true,
+  "component_mode": "bottom_center",
+  "fit_mode": "ls"
+}
