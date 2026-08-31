@@ -9,6 +9,12 @@ Terminal input does not provide key-up events. A held key is therefore inferred
 from OS key-repeat events. The first key press starts at a moderate RPM; repeated
 same-direction events increase the target linearly toward the configured maximum.
 The target never ramps by itself after key repeats stop.
+
+Space toggles the existing relay-based ``PumpController``. Because the current
+pump hardware is relay driven, ON means full output (100%); there is no PWM
+percentage control in this path. This manual bring-up tool explicitly opens the
+pump zone interlock while it is running, but retains the pump continuous-run
+watchdog and always turns the pump off during cleanup.
 """
 
 from __future__ import annotations
@@ -25,6 +31,7 @@ _FARM_ROBOT = str(Path(__file__).resolve().parents[1])
 if _FARM_ROBOT not in sys.path:
     sys.path.insert(0, _FARM_ROBOT)
 
+from actuators.pump_controller import PumpController  # noqa: E402
 from control.mega_motion import MegaMotion  # noqa: E402
 
 
@@ -66,7 +73,7 @@ def wheel_targets(key: str, rpm: float, turn_scale: float) -> tuple[float, float
 def print_help(start_rpm: float, max_rpm: float, ramp_sec: float, turn_scale: float) -> None:
     print(
         "\nControls: W forward | S reverse | A left | D right | "
-        "X/Space stop | P state | +/- max RPM | Q quit"
+        "X motor stop | Space pump ON/OFF | P state | +/- max RPM | Q quit"
     )
     print(
         f"Hold/repeat: {start_rpm:.0f} -> {max_rpm:.0f} RPM over {ramp_sec:.1f}s; "
@@ -74,24 +81,42 @@ def print_help(start_rpm: float, max_rpm: float, ramp_sec: float, turn_scale: fl
     )
     print(
         f"First-repeat grace={INITIAL_REPEAT_GRACE_SEC:.2f}s, "
-        f"release stop={RELEASE_DEADMAN_SEC:.2f}s after repeats begin.\n"
+        f"release stop={RELEASE_DEADMAN_SEC:.2f}s after repeats begin."
     )
+    print("Pump: relay output, Space toggles OFF <-> ON (100%).\n")
 
 
-def print_state(motion: MegaMotion) -> None:
+def print_state(motion: MegaMotion, pump: PumpController) -> None:
     motion.request_status()
     time.sleep(0.06)
     state = motion.state
     print(
         f"\nSTATE mode={state.mode} "
         f"L={state.left_rpm:+.1f}rpm R={state.right_rpm:+.1f}rpm "
-        f"Ldeg={state.left_degrees:+.1f} Rdeg={state.right_degrees:+.1f}"
+        f"Ldeg={state.left_degrees:+.1f} Rdeg={state.right_degrees:+.1f} "
+        f"pump={'ON(100%)' if pump.is_on() else 'OFF'}"
     )
+
+
+def toggle_pump(pump: PumpController) -> None:
+    if pump.is_on():
+        pump.turn_off()
+        print("\nPUMP OFF")
+        return
+
+    if not getattr(pump, "_gpio_ready", False):
+        print("\nPUMP unavailable: GPIO initialization failed", file=sys.stderr)
+        return
+
+    if pump.turn_on():
+        print("\nPUMP ON (100%)")
+    else:
+        print("\nPUMP ON blocked by PumpController interlock", file=sys.stderr)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Ramped WASD test through the production MegaMotion abstraction"
+        description="Ramped WASD and pump test through production robot abstractions"
     )
     parser.add_argument("--port", help="Mega serial device; auto-detect when omitted")
     parser.add_argument(
@@ -135,6 +160,12 @@ def main() -> int:
         motion.cleanup()
         return 1
 
+    pump = PumpController()
+    # This is an explicit manual hardware bring-up tool. Autonomous driving
+    # continues to control the real in-furrow zone interlock separately.
+    pump.set_zone(True)
+    pump.turn_off()
+
     fd = sys.stdin.fileno()
     old_term = termios.tcgetattr(fd)
 
@@ -148,6 +179,10 @@ def main() -> int:
     try:
         print("MegaMotion abstraction connected.")
         print(f"refresh={REFRESH_SEC:.2f}s; firmware DRIVE watchdog remains active")
+        if getattr(pump, "_gpio_ready", False):
+            print("PumpController GPIO ready; Space toggles relay at 100% output")
+        else:
+            print("WARNING: PumpController GPIO is not ready; Space cannot drive the pump")
         print_help(start_rpm, max_rpm, ramp_sec, turn_scale)
         tty.setcbreak(fd)
 
@@ -187,19 +222,23 @@ def main() -> int:
                     next_refresh = now + REFRESH_SEC
                     print(
                         f"\rDRIVE L={left:+.0f} R={right:+.0f} RPM "
-                        f"hold={now - held_since:.2f}s          ",
+                        f"hold={now - held_since:.2f}s "
+                        f"pump={'ON' if pump.is_on() else 'OFF'}          ",
                         end="",
                         flush=True,
                     )
 
-                elif key in ("x", " "):
+                elif key == "x":
                     active_key = None
                     repeat_seen = False
                     motion.stop()
-                    print("\rSTOP                                           ", end="", flush=True)
+                    print("\rMOTOR STOP                                     ", end="", flush=True)
+
+                elif key == " ":
+                    toggle_pump(pump)
 
                 elif key == "p":
-                    print_state(motion)
+                    print_state(motion, pump)
 
                 elif key in ("+", "="):
                     max_rpm = clamp(max_rpm + RPM_STEP, start_rpm, MAX_TEST_RPM)
@@ -222,12 +261,16 @@ def main() -> int:
                     active_key = None
                     repeat_seen = False
                     motion.stop()
-                    print("\rDEADMAN STOP                                   ", end="", flush=True)
+                    print("\rDEADMAN MOTOR STOP                             ", end="", flush=True)
                 elif now >= next_refresh:
                     left, right = wheel_targets(active_key, current_rpm, turn_scale)
                     if not motion.set_wheel_rpm(left, right):
                         raise RuntimeError(motion.last_error or "failed to refresh DRIVE")
                     next_refresh = now + REFRESH_SEC
+
+            # Keep PumpController's maximum-continuous-run watchdog active even
+            # while this manual teleop loop is otherwise idle.
+            pump.tick()
 
             if motion.faulted:
                 raise RuntimeError(motion.last_error or "Mega Motion fault")
@@ -239,11 +282,13 @@ def main() -> int:
         return 1
     finally:
         try:
+            pump.turn_off()
             motion.stop()
         finally:
+            pump.cleanup()
             motion.cleanup()
             termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
-        print("\nStopped.")
+        print("\nStopped. Pump OFF, motors STOP.")
 
     return 0
 
