@@ -14,8 +14,9 @@
  *   ACK <seq> | DONE <seq> | STOPPED | PONG | ERR <reason>
  *
  * DRIVE must be refreshed by the Pi control loop and times out after 400 ms.
- * HB is intended only for a blocking MOVE. USB disconnect therefore stops
- * either mode without depending on Linux or Python cleanup.
+ * HB refreshes only a blocking MOVE. STATUS/PING are diagnostic commands and
+ * deliberately do not refresh either motion watchdog. USB disconnect therefore
+ * stops either mode without depending on Linux or Python cleanup.
  */
 
 /* BTS7960 pin map: keep R_EN/L_EN high on each driver. */
@@ -83,7 +84,8 @@ bool motorsEnabled = false;
 int32_t positionTarget[2] = {0, 0};
 float moveMaxRpm = MANUAL_RPM;
 uint32_t activeSequence = 0;
-uint32_t lastLinkMs = 0;
+uint32_t lastDriveCommandMs = 0;
+uint32_t lastPositionLinkMs = 0;
 uint32_t nextControlUs = 0;
 uint32_t nextPositionUs = 0;
 uint32_t nextTelemetryMs = 0;
@@ -232,7 +234,7 @@ void driveVelocity(float logicalLeftRpm, float logicalRightRpm) {
 
   if (fabs(logicalLeftRpm) < 0.01f && fabs(logicalRightRpm) < 0.01f) {
     stopMotors();
-    lastLinkMs = millis();
+    lastDriveCommandMs = millis();
     return;
   }
 
@@ -246,7 +248,7 @@ void driveVelocity(float logicalLeftRpm, float logicalRightRpm) {
   motorsEnabled = true;
   controlMode = ControlMode::MANUAL;
   activeSequence = 0;
-  lastLinkMs = millis();
+  lastDriveCommandMs = millis();
 }
 
 int32_t degreesToCounts(float degrees, float cpr, int8_t forwardSign) {
@@ -265,7 +267,7 @@ void beginPositionMove(uint32_t sequence, float leftDegrees, float rightDegrees,
   resetBothPid();
   motorsEnabled = true;
   controlMode = ControlMode::POSITION;
-  lastLinkMs = millis();
+  lastPositionLinkMs = millis();
   nextPositionUs = micros();
 }
 
@@ -392,25 +394,24 @@ void processLine(char *line) {
   }
 
   if (strcmp(command, "HB") == 0) {
-    lastLinkMs = millis();
+    if (controlMode == ControlMode::POSITION) {
+      lastPositionLinkMs = millis();
+    }
     return;
   }
 
   if (strcmp(command, "STOP") == 0) {
     stopMotors();
-    lastLinkMs = millis();
     Serial.println(F("STOPPED"));
     return;
   }
 
   if (strcmp(command, "STATUS") == 0) {
-    lastLinkMs = millis();
     printStatus();
     return;
   }
 
   if (strcmp(command, "PING") == 0) {
-    lastLinkMs = millis();
     Serial.println(F("PONG"));
     return;
   }
@@ -489,7 +490,8 @@ void setup() {
   nextControlUs = micros() + CONTROL_PERIOD_US;
   nextPositionUs = micros() + POSITION_PERIOD_US;
   nextTelemetryMs = millis() + TELEMETRY_PERIOD_MS;
-  lastLinkMs = millis();
+  lastDriveCommandMs = millis();
+  lastPositionLinkMs = millis();
 }
 
 void loop() {
@@ -513,14 +515,19 @@ void loop() {
     printStatus();
   }
 
-  const uint32_t silenceMs = static_cast<uint32_t>(nowMs - lastLinkMs);
-  if (controlMode == ControlMode::MANUAL && silenceMs > DRIVE_TIMEOUT_MS) {
-    stopMotors();
-    Serial.println(F("ERR DRIVE_TIMEOUT"));
-  } else if (controlMode == ControlMode::POSITION && silenceMs > LINK_TIMEOUT_MS) {
-    const uint32_t stoppedSequence = activeSequence;
-    stopMotors();
-    Serial.print(F("ERR LINK_TIMEOUT "));
-    Serial.println(stoppedSequence);
+  if (controlMode == ControlMode::MANUAL) {
+    const uint32_t driveSilenceMs = static_cast<uint32_t>(nowMs - lastDriveCommandMs);
+    if (driveSilenceMs > DRIVE_TIMEOUT_MS) {
+      stopMotors();
+      Serial.println(F("ERR DRIVE_TIMEOUT"));
+    }
+  } else if (controlMode == ControlMode::POSITION) {
+    const uint32_t linkSilenceMs = static_cast<uint32_t>(nowMs - lastPositionLinkMs);
+    if (linkSilenceMs > LINK_TIMEOUT_MS) {
+      const uint32_t stoppedSequence = activeSequence;
+      stopMotors();
+      Serial.print(F("ERR LINK_TIMEOUT "));
+      Serial.println(stoppedSequence);
+    }
   }
 }

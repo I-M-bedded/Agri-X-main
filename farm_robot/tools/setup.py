@@ -8,7 +8,7 @@ tools/setup.py
 
 메뉴
   1) 센서 배선 점검   - 모터를 돌리지 않고 ToF/카메라/수위/엔코더만 확인
-  2) 모터·부호 점검   - 바퀴를 띄운 상태에서 조향 부호와 데드밴드 실측
+  2) 모터·부호 점검   - 바퀴를 띄운 상태에서 조향 부호와 저속 구동을 확인
   3) 흙 색상 보정     - 비전이 흙을 제대로 인식하도록 HSV 임계값 조절
 
 반드시 1 -> 2 -> 3 순서로 진행하세요.
@@ -46,6 +46,28 @@ def ask(question: str) -> bool:
 
 def hint(sign_name: str):
     print(f"     [조치] config.py 의 {sign_name} 부호를 뒤집으세요 (+1 <-> -1).")
+
+
+def mega_firmware_hint(name: str):
+    print(
+        f"     [조치] firmware/agrix_motor_mega/agrix_motor_mega.ino 의 {name} "
+        "값을 점검한 뒤 Mega에 다시 업로드하세요."
+    )
+
+
+def hold_drive(motors, command, duration: float, refresh_sec: float = 0.10):
+    """Keep a DRIVE command alive without weakening the Mega's 400 ms watchdog."""
+    deadline = time.monotonic() + max(0.0, float(duration))
+    try:
+        while True:
+            if not command():
+                raise RuntimeError(motors.last_error or "Mega DRIVE 송신 실패")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            time.sleep(min(refresh_sec, remaining))
+    finally:
+        motors.stop()
 
 
 # ======================================================================
@@ -152,27 +174,55 @@ def check_sensors() -> int:
     from sensors.odometry import Odometry
 
     odom = Odometry()
-    if not odom.is_available():
-        ok_all = False
-        print("  [실패] 엔코더 GPIO 초기화 실패.")
-    else:
-        print("  10초간 바퀴를 **손으로** 굴려 보세요. 틱이 올라가야 합니다.")
-        start = odom.total_ticks
-        t_end = time.monotonic() + 10.0
-        while time.monotonic() < t_end:
-            odom.update()
-            print(f"    누적 틱={odom.total_ticks}  "
-                  f"주행거리={odom.path_length:.3f}m  헤딩={odom.theta:+.2f}rad")
-            time.sleep(0.5)
-        if odom.total_ticks == start:
-            ok_all = False
-            print(f"  [실패] 틱이 전혀 들어오지 않았습니다. 핀 확인 (BCM): "
-                  f"좌={config.ENCODER_PINS['left']} 우={config.ENCODER_PINS['right']}")
+    mega = None
+    try:
+        if getattr(config, "ODOMETRY_SOURCE", "") == "mega_usb":
+            from control.mega_motion import MegaMotion
+
+            mega = MegaMotion(odometry=odom)
+            encoder_ready = mega.available and not mega.faulted
+            if not encoder_ready:
+                ok_all = False
+                print(f"  [실패] Mega Motion USB 연결 실패: {mega.last_error}")
+                print("    - Mega에 agrix_motor_mega.ino 업로드 여부 확인")
+                print("    - /dev/ttyACM0 또는 /dev/serial/by-id 장치 확인")
+                print("    - Mega 엔코더: M1 D2/D3, M2 D18/D19 배선 확인")
         else:
-            print(f"  [OK] 틱 {odom.total_ticks - start}개 수신")
-            print("  [참고] 바퀴를 정확히 10바퀴 돌린 뒤 '누적 틱 / 10' 을")
-            print("         config.TICKS_PER_REVOLUTION 에 넣으세요.")
-    odom.cleanup()
+            encoder_ready = odom.is_available()
+            if not encoder_ready:
+                ok_all = False
+                print("  [실패] 엔코더 GPIO 초기화 실패.")
+
+        if encoder_ready:
+            print("  10초간 바퀴를 **손으로** 굴려 보세요. 값이 올라가야 합니다.")
+            start = odom.total_ticks
+            t_end = time.monotonic() + 10.0
+            while time.monotonic() < t_end:
+                odom.update()
+                print(f"    누적 갱신={odom.total_ticks}  "
+                      f"주행거리={odom.path_length:.3f}m  헤딩={odom.theta:+.2f}rad")
+                time.sleep(0.5)
+            if odom.total_ticks == start:
+                ok_all = False
+                if mega is not None:
+                    print("  [실패] Mega STATE에서 엔코더 변화가 전혀 들어오지 않았습니다.")
+                    print("    - M1 엔코더 D2/D3, M2 엔코더 D18/D19 배선 확인")
+                    print("    - 펌웨어 ENCODER1_SIGN / ENCODER2_SIGN 및 CPR 확인")
+                else:
+                    print(f"  [실패] 틱이 전혀 들어오지 않았습니다. 핀 확인 (BCM): "
+                          f"좌={config.ENCODER_PINS['left']} 우={config.ENCODER_PINS['right']}")
+            else:
+                print(f"  [OK] 엔코더 갱신 {odom.total_ticks - start}회 수신")
+                if mega is not None:
+                    print("  [참고] Mega가 출력축 각도를 계산하므로 Pi의 TICKS_PER_REVOLUTION은")
+                    print("         사용하지 않습니다. CPR은 Mega 펌웨어에서 관리합니다.")
+                else:
+                    print("  [참고] 바퀴를 정확히 10바퀴 돌린 뒤 '누적 틱 / 10' 을")
+                    print("         config.TICKS_PER_REVOLUTION 에 넣으세요.")
+    finally:
+        if mega is not None:
+            mega.cleanup()
+        odom.cleanup()
 
     title("센서 점검 결과")
     if ok_all:
@@ -203,64 +253,66 @@ def check_motors() -> int:
     motors = MegaMotion(odometry=odom)
     problems = []
 
+    if not motors.available or motors.faulted:
+        print(f"  [실패] Mega Motion 연결 실패: {motors.last_error}")
+        motors.cleanup()
+        odom.cleanup()
+        return 1
+
     try:
         # ---------- 좌/우 식별 ----------
         title("2-1. 좌/우 바퀴 식별")
         print("  좌측 바퀴만 전진합니다 (2초)")
-        motors.set_speeds(0.4, 0.0)
-        time.sleep(2.0)
-        motors.stop()
+        hold_drive(motors, lambda: motors.set_speeds(0.4, 0.0), 2.0)
         if not ask("실제로 '왼쪽' 바퀴가 '전진' 방향으로 돌았습니까?"):
             problems.append("좌측 모터")
-            hint("SIGN_LEFT_MOTOR (또는 MOTOR_PINS 의 left_* 배선)")
+            print("     [조치] 다른 바퀴가 돌면 Mega M1/M2 드라이버 배선을 교환하세요.")
+            mega_firmware_hint("MOTOR1_FORWARD_SIGN (방향이 반대인 경우)")
 
         print("\n  우측 바퀴만 전진합니다 (2초)")
-        motors.set_speeds(0.0, 0.4)
-        time.sleep(2.0)
-        motors.stop()
+        hold_drive(motors, lambda: motors.set_speeds(0.0, 0.4), 2.0)
         if not ask("실제로 '오른쪽' 바퀴가 '전진' 방향으로 돌았습니까?"):
             problems.append("우측 모터")
-            hint("SIGN_RIGHT_MOTOR (또는 MOTOR_PINS 의 right_* 배선)")
+            print("     [조치] 다른 바퀴가 돌면 Mega M1/M2 드라이버 배선을 교환하세요.")
+            mega_firmware_hint("MOTOR2_FORWARD_SIGN (방향이 반대인 경우)")
 
         # ---------- 조향 부호 ----------
         title("2-2. 조향 부호 (가장 중요)")
         print("  drive(base=0.3, steer=+0.2) - 규약상 '오른쪽으로 조향' (2초)")
-        motors.drive(0.3, 0.2)
-        time.sleep(2.0)
-        motors.stop()
+        hold_drive(motors, lambda: motors.drive(0.3, 0.2), 2.0)
         if not ask("좌측 바퀴가 우측보다 '빠르게' 돌았습니까? (= 우회전 자세)"):
             problems.append("조향 믹싱")
-            print("     [조치] 좌우 모터 배선이 서로 바뀐 것입니다. 배선을 교체하거나")
-            print("            SIGN_LEFT_MOTOR / SIGN_RIGHT_MOTOR 를 함께 점검하세요.")
+            print("     [조치] Pi의 arcade mix는 정상 규약입니다. Mega M1/M2가 실제")
+            print("            좌/우 바퀴와 바뀌어 연결되지 않았는지 확인하세요.")
 
         # ---------- 엔코더 방향 ----------
         title("2-3. 엔코더 방향")
         print("  양 바퀴 전진 (3초)")
         odom.reset()
         before = odom.total_ticks
-        motors.forward(0.4)
-        time.sleep(3.0)
-        motors.stop()
+        hold_drive(motors, lambda: motors.forward(0.4), 3.0)
         odom.update()
         gained = odom.total_ticks - before
-        print(f"     틱 수신: {gained}개, 추정 이동거리: {odom.x:+.3f} m")
+        print(f"     갱신 수신: {gained}회, 추정 이동거리: {odom.x:+.3f} m")
         if gained == 0:
             problems.append("엔코더 신호 없음")
-            print("     [조치] ENCODER_PINS 배선, 풀업, ENCODER_EDGE 설정을 확인하세요.")
+            print("     [조치] Mega 엔코더 배선 M1 D2/D3, M2 D18/D19를 확인하세요.")
         elif odom.x <= 0:
             problems.append("엔코더 방향")
-            hint("SIGN_LEFT_ENCODER / SIGN_RIGHT_ENCODER")
+            mega_firmware_hint("ENCODER1_SIGN / ENCODER2_SIGN")
 
         print("\n  제자리 좌회전(반시계) - 규약상 theta 가 '증가'해야 함 (2초)")
         odom.reset()
-        motors.rotate_in_place(clockwise=False, speed=0.4)
-        time.sleep(2.0)
-        motors.stop()
+        hold_drive(
+            motors,
+            lambda: motors.rotate_in_place(clockwise=False, speed=0.4),
+            2.0,
+        )
         odom.update()
         print(f"     theta 변화: {odom.theta:+.3f} rad")
         if odom.theta <= 0:
             problems.append("헤딩 부호")
-            print("     [조치] 좌우 엔코더 배선이 바뀌었거나 SIGN_*_ENCODER 가 반대입니다.")
+            print("     [조치] Mega M1/M2 엔코더가 서로 바뀌었거나 ENCODER*_SIGN이 반대입니다.")
 
         # ---------- 180도 정밀도 ----------
         title("2-4. 180도 회전 정밀도 (유턴에 직결)")
@@ -271,29 +323,32 @@ def check_motors() -> int:
         print(f"     엔코더 추정: {odom.theta:+.3f} rad "
               f"({odom.theta * 57.3:+.1f}도), 도달={ok}")
         print("     실제로 몇 도 돌았는지 눈으로 재보세요.")
-        print("     오차가 크면 WHEEL_BASE_M / TICKS_PER_REVOLUTION / WHEEL_RADIUS_M 을")
-        print("     다시 실측하세요 (특히 WHEEL_BASE_M 이 각도에 직접 영향).")
+        print("     오차가 크면 TRACK_WIDTH_M / TRACK_SLIP_FACTOR / WHEEL_RADIUS_M 을")
+        print("     다시 실측하세요. Mega 엔코더 CPR은 펌웨어에서 관리합니다.")
 
-        # ---------- 데드밴드 ----------
-        title("2-5. 데드밴드 실측")
-        print("  바퀴가 '겨우 돌기 시작하는' 듀티를 찾습니다.")
-        print(f"  현재 설정 MOTOR_MIN_DUTY = {config.MOTOR_MIN_DUTY}")
+        # ---------- 저속 구동 ----------
+        title("2-5. 최소 안정 속도 명령 확인")
+        print("  Mega는 PWM 듀티가 아니라 목표 RPM을 PID로 제어합니다.")
+        print("  바퀴가 안정적으로 돌기 시작하는 정규화 속도 명령을 확인합니다.")
         found = None
-        for duty in [0.05, 0.08, 0.10, 0.12, 0.15, 0.18, 0.22, 0.26, 0.30]:
-            motors.set_speeds(duty, duty)
-            time.sleep(1.2)
-            moving = ask(f"듀티 {duty:.2f} 에서 바퀴가 돌았습니까?")
-            motors.stop()
+        for command in [0.05, 0.08, 0.10, 0.12, 0.15, 0.18, 0.22, 0.26, 0.30]:
+            hold_drive(
+                motors,
+                lambda command=command: motors.set_speeds(command, command),
+                1.2,
+            )
+            moving = ask(f"속도 명령 {command:.2f} 에서 바퀴가 안정적으로 돌았습니까?")
             if moving:
-                found = duty
+                found = command
                 break
         if found is not None:
-            print(f"     [결과] 최소 구동 듀티 ~= {found:.2f}")
-            print(f"     [조치] config.MOTOR_MIN_DUTY 를 {found:.2f} 근처로 설정하세요.")
-            print("            이 값이 입구 정렬의 수렴 가능 여부를 좌우합니다.")
+            rpm = found * config.MEGA_DRIVE_MAX_RPM
+            print(f"     [결과] 최소 안정 속도 명령 ~= {found:.2f} ({rpm:.1f} RPM 목표)")
+            print("     [참고] config.MOTOR_MIN_DUTY는 Pi 직접 GPIO 경로용이며 Mega에는")
+            print("            적용되지 않습니다. 저속 성능은 Mega PID/전원/마찰을 튜닝하세요.")
         else:
-            problems.append("데드밴드가 0.30 이상")
-            print("     [경고] 0.30 에서도 안 돌면 전원/드라이버 용량 문제입니다.")
+            problems.append("저속 구동 불안정")
+            print("     [경고] 0.30 명령에서도 안 돌면 전원/드라이버/PID/기계 마찰을 확인하세요.")
 
         # ---------- 펌프 인터록 ----------
         title("2-6. 펌프 인터록")
@@ -458,6 +513,12 @@ def calibrate_tracks() -> int:
     motors = MegaMotion(odometry=odom)
     results = {}
 
+    if not motors.available or motors.faulted:
+        print(f"  [실패] Mega Motion 연결 실패: {motors.last_error}")
+        motors.cleanup()
+        odom.cleanup()
+        return 1
+
     try:
         # ---------------- 직진 거리 보정 ----------------
         title("4-1. 직진 거리 보정")
@@ -467,12 +528,15 @@ def calibrate_tracks() -> int:
 
         odom.reset()
         target = 2.0
-        motors.forward(0.4)
         t0 = time.monotonic()
-        while odom.path_length < target and time.monotonic() - t0 < 30.0:
-            odom.update()
-            time.sleep(0.05)
-        motors.stop()
+        try:
+            while odom.path_length < target and time.monotonic() - t0 < 30.0:
+                if not motors.forward(0.4):
+                    raise RuntimeError(motors.last_error or "Mega DRIVE 송신 실패")
+                odom.update()
+                time.sleep(0.05)
+        finally:
+            motors.stop()
         odom.update()
         est = odom.path_length
         print(f"\n  엔코더 추정 이동거리: {est:.3f} m")
@@ -524,23 +588,26 @@ def calibrate_tracks() -> int:
             print("     [경고] 미끄러짐이 매우 큽니다. 궤도 장력 또는 지면을 확인하세요.")
             print("            이 상태로는 유턴 정밀도가 낮아 IMU 추가를 권합니다.")
 
-        # ---------------- 최소 구동 듀티 ----------------
-        title("4-3. 최소 구동 듀티 (궤도는 바퀴보다 높습니다)")
-        print("  궤도가 '겨우 움직이기 시작하는' 듀티를 찾습니다.")
+        # ---------------- 최소 안정 속도 ----------------
+        title("4-3. 최소 안정 속도 명령")
+        print("  Mega PID에서 궤도가 안정적으로 움직이기 시작하는 속도를 확인합니다.")
         found = None
-        for duty in [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45]:
-            motors.set_speeds(duty, duty)
-            time.sleep(1.2)
-            moving = ask(f"듀티 {duty:.2f} 에서 궤도가 움직였습니까?")
-            motors.stop()
+        for command in [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45]:
+            hold_drive(
+                motors,
+                lambda command=command: motors.set_speeds(command, command),
+                1.2,
+            )
+            moving = ask(f"속도 명령 {command:.2f} 에서 궤도가 움직였습니까?")
             if moving:
-                found = duty
+                found = command
                 break
         if found is not None:
-            results["MOTOR_MIN_DUTY"] = found
-            print(f"  -> MOTOR_MIN_DUTY = {found:.2f}")
+            rpm = found * config.MEGA_DRIVE_MAX_RPM
+            print(f"  -> 최소 안정 속도 명령 ~= {found:.2f} ({rpm:.1f} RPM 목표)")
+            print("     config.MOTOR_MIN_DUTY는 Mega 경로에 적용되지 않습니다.")
         else:
-            print("     [경고] 0.45 에서도 안 움직입니다. 전원/드라이버 용량 문제입니다.")
+            print("     [경고] 0.45 명령에서도 안 움직입니다. 전원/드라이버/PID를 확인하세요.")
 
     finally:
         motors.stop()
@@ -556,7 +623,7 @@ def calibrate_tracks() -> int:
     for k, v in results.items():
         print(f"  {k} = {v}")
     print()
-    print("  위 세 줄을 config.py 에서 찾아 값만 바꾸면 됩니다.")
+    print("  위 값을 config.py 에서 찾아 바꾸면 됩니다.")
     print("  바꾼 뒤 tools/setup.py 2번으로 180도 회전이 맞는지 다시 확인하세요.")
     return 0
 
@@ -566,7 +633,7 @@ def main():
         "1": ("센서 배선 점검 (모터 안 돎)", check_sensors),
         "2": ("모터·부호 점검 (바퀴 띄우고!)", check_motors),
         "3": ("흙 색상 보정 (HSV)", None),
-        "4": ("무한궤도 보정 (회전·거리·듀티)", calibrate_tracks),
+        "4": ("무한궤도 보정 (회전·거리·저속)", calibrate_tracks),
     }
 
     # 인자로 바로 실행:  python3 tools/setup.py 2

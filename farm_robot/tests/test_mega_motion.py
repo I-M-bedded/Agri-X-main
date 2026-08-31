@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from control.mega_motion import MegaMotion
+from control.mega_motion import MegaMotion, MegaProtocolError
 from sensors.odometry import Odometry
 
 
@@ -100,6 +100,36 @@ class MegaMotionTest(unittest.TestCase):
             time.sleep(0.005)
         self.assertEqual(odom.deltas, [(3.5, -2.0)])
         self.assertEqual(motion.state.mode, "MANUAL")
+
+    def test_protocol_error_latches_fault_and_blocks_new_motion(self):
+        motion, serial = self.make_motion()
+        motion._handle_line("ERR DRIVE_TIMEOUT")
+        before = list(serial.writes)
+
+        self.assertTrue(motion.faulted)
+        self.assertFalse(motion.set_speeds(0.5, 0.5))
+        self.assertEqual(serial.writes, before)
+        self.assertTrue(motion.stop())
+        self.assertEqual(serial.writes[-1], "STOP")
+
+        with self.assertRaises(MegaProtocolError):
+            motion.move(90.0, 90.0, 40.0, timeout=0.2, sequence=9)
+
+    def test_unexpected_ready_faults_and_resets_odometry_baseline(self):
+        odom = FakeOdometry()
+        motion, _serial = self.make_motion(odom)
+        motion._handle_line("STATE 0 MANUAL 100.00 120.00 5.00 5.00")
+        motion._handle_line("STATE 0 MANUAL 105.00 125.00 5.00 5.00")
+        self.assertEqual(odom.deltas, [(5.0, 5.0)])
+
+        motion._handle_line("READY MEGA_MOTION_V2")
+        self.assertTrue(motion.faulted)
+        self.assertIn("reboot", motion.last_error.lower())
+
+        # Firmware counters restart from zero after a Mega reboot. That first
+        # post-reset STATE must become a new baseline, not a -105/-125 deg jump.
+        motion._handle_line("STATE 0 IDLE 0.00 0.00 0.00 0.00")
+        self.assertEqual(odom.deltas, [(5.0, 5.0)])
 
     def test_cleanup_sends_stop(self):
         motion, serial = self.make_motion()

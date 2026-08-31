@@ -165,8 +165,13 @@ class MegaMotion:
     def _clamp(value: float, limit: float = 1.0) -> float:
         return max(-limit, min(limit, float(value)))
 
-    def _send(self, line: str) -> bool:
-        if not self.available or self._serial is None or self._closed:
+    def _send(self, line: str, *, allow_when_faulted: bool = False) -> bool:
+        if (
+            not self.available
+            or self._serial is None
+            or self._closed
+            or (self.faulted and not allow_when_faulted)
+        ):
             return False
         try:
             payload = (line + "\n").encode("ascii")
@@ -176,6 +181,7 @@ class MegaMotion:
         except Exception as exc:
             self.last_error = str(exc)
             self.available = False
+            self.faulted = True
             log.error("Mega Motion 송신 실패: %s", exc)
             with self._condition:
                 self._error_generation += 1
@@ -190,6 +196,7 @@ class MegaMotion:
                 if not self._closed:
                     self.last_error = str(exc)
                     self.available = False
+                    self.faulted = True
                     log.error("Mega Motion 수신 실패: %s", exc)
                     with self._condition:
                         self._error_generation += 1
@@ -239,7 +246,16 @@ class MegaMotion:
             log.info("Mega firmware: %s", line)
             if line == "READY MEGA_MOTION_V2":
                 with self._condition:
-                    self.protocol_ready = True
+                    if self.protocol_ready:
+                        # USB CDC re-enumeration or a Mega reset zeroes the firmware
+                        # encoder counters. Never turn that reset into a huge fake
+                        # odometry delta or silently resume a motion command.
+                        self._previous_degrees = None
+                        self.last_error = "Mega reboot detected after link establishment"
+                        self.faulted = True
+                        self._error_generation += 1
+                    else:
+                        self.protocol_ready = True
                     self._condition.notify_all()
         elif line.startswith("ERR "):
             self.last_error = line
@@ -264,16 +280,16 @@ class MegaMotion:
 
     # Continuous navigation commands. Values remain normalized at the FSM
     # boundary, but USB carries physical output-shaft RPM.
-    def set_speeds(self, left_speed: float, right_speed: float):
+    def set_speeds(self, left_speed: float, right_speed: float) -> bool:
         left = self._clamp(left_speed)
         right = self._clamp(right_speed)
         self.last_left, self.last_right = left, right
-        self._send(
+        return self._send(
             f"DRIVE {left * MEGA_DRIVE_MAX_RPM:.3f} "
             f"{right * MEGA_DRIVE_MAX_RPM:.3f}"
         )
 
-    def drive(self, base_speed: float, steer: float):
+    def drive(self, base_speed: float, steer: float) -> bool:
         """Arcade mix; positive steer turns right, matching the FSM convention."""
 
         left = float(base_speed) + float(steer)
@@ -286,20 +302,19 @@ class MegaMotion:
             )
             left -= shift
             right -= shift
-        self.set_speeds(left, right)
+        return self.set_speeds(left, right)
 
-    def forward(self, speed: float):
-        self.set_speeds(speed, speed)
+    def forward(self, speed: float) -> bool:
+        return self.set_speeds(speed, speed)
 
-    def rotate_in_place(self, clockwise: bool = True, speed: float = 0.3):
+    def rotate_in_place(self, clockwise: bool = True, speed: float = 0.3) -> bool:
         if clockwise:
-            self.set_speeds(speed, -speed)
-        else:
-            self.set_speeds(-speed, speed)
+            return self.set_speeds(speed, -speed)
+        return self.set_speeds(-speed, speed)
 
-    def stop(self):
+    def stop(self) -> bool:
         self.last_left = self.last_right = 0.0
-        self._send("STOP")
+        return self._send("STOP", allow_when_faulted=True)
 
     # Finite encoder-position moves.
     def _new_sequence(self) -> int:
@@ -320,7 +335,8 @@ class MegaMotion:
             if now >= deadline:
                 return False
             if now >= next_heartbeat:
-                self._send("HB")
+                if not self._send("HB"):
+                    raise MegaMotionError(self.last_error or "failed to send heartbeat")
                 next_heartbeat = now + MEGA_HEARTBEAT_SEC
             with self._condition:
                 self._condition.wait(timeout=min(0.05, deadline - now))
@@ -338,6 +354,8 @@ class MegaMotion:
 
         if not self.available:
             raise MegaMotionError(self.last_error or "Mega Motion is unavailable")
+        if self.faulted:
+            raise MegaProtocolError(self.last_error or "Mega Motion is faulted")
         values = (left_degrees, right_degrees, max_rpm, timeout)
         if not all(math.isfinite(float(value)) for value in values):
             raise ValueError("move arguments must be finite")
@@ -394,8 +412,8 @@ class MegaMotion:
     def turn_180_blocking(self, speed: float = 0.3) -> bool:
         return self.turn_by_angle_blocking(-math.pi, speed=speed)
 
-    def request_status(self):
-        self._send("STATUS")
+    def request_status(self) -> bool:
+        return self._send("STATUS", allow_when_faulted=True)
 
     def link_ok(self, max_age: float = 0.5) -> bool:
         return (
