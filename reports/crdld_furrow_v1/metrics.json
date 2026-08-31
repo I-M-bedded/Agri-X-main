@@ -1,0 +1,41 @@
+{
+  "frames_total": 430,
+  "frames_with_gt_line": 430,
+  "frames_with_pred_line": 430,
+  "detection_rate": 1.0,
+  "angle_error_deg": {
+    "mean": 5.323846183031513,
+    "median": 1.2583600036784688,
+    "p95": 28.38083249642531,
+    "n": 430
+  },
+  "lateral_near_px": {
+    "mean": 19.43468548921573,
+    "median": 3.444738582841957,
+    "p95": 99.74113951352015,
+    "n": 430
+  },
+  "lateral_far_px": {
+    "mean": 13.02583209052375,
+    "median": 1.9679215018784504,
+    "p95": 56.14021207928479,
+    "n": 430
+  },
+  "line_iou": {
+    "mean": 0.4163838703737765,
+    "median": 0.4728868852550332,
+    "p95": 0.8718646552784295,
+    "n": 430
+  },
+  "nav_mask_iou": {
+    "mean": 0.47945416949115344,
+    "median": 0.4972474912021334,
+    "p95": 0.6123807527613008,
+    "n": 430
+  },
+  "line_accuracy": 0.6930232558139535,
+  "accuracy_criterion": "AE<=5.0deg AND lateral_near<=10.0px",
+  "checkpoint": "C:\\Users\\JUN\\Documents\\Agri-X-main\\runs\\crdld_furrow_v1\\best.pt",
+  "checkpoint_epoch": 116,
+  "split": "test"
+}

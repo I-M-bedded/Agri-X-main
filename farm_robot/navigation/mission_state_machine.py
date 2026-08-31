@@ -52,6 +52,7 @@ from config import (
     BASE_SPEED,
     CONTROL_LOOP_DT,
     ENTRANCE_ENTER_DISTANCE_M,
+    ENTRANCE_REQUIRE_WALLS_BEFORE_ENTER,
     ENTRANCE_ALLOW_BLIND_CREEP,
     ENTRANCE_HEADING_THRESHOLD_RAD,
     ENTRANCE_VISION_CENTER_THRESHOLD,
@@ -81,11 +82,16 @@ from config import (
     GATE_HEADING_ANCHOR_MAX_DISTANCE_M,
     GATE_HEADING_ANCHOR_MIN_BASELINE_M,
     HOME_RETURN_MARKER_LOCALIZATION,
+    FURROW_WALL_ACQUIRE_MAX_TRAVEL_M,
     FURROW_WALL_ACQUIRE_SEC,
     MIN_FURROW_TRAVEL_DISTANCE_M,
     EXIT_FORWARD_DURATION_SEC,
     FIELD_END_MARKER_ID,
+    MARKER_ON_RIDGE_CENTER,
+    MARKER_POST_LATERAL_OFFSET_M,
+    FIELD_HEADING_REANCHOR_MAX_DRIFT_DEG,
     HEADLAND_DIRECTION,
+    HEADLAND_ANCHOR_HEADING,
     HEADLAND_ENABLED,
     HEADLAND_FALLBACK_DURATION_SEC,
     HEADLAND_SCAN_EVERY_N_TICKS,
@@ -93,8 +99,10 @@ from config import (
     HEADLAND_STEP_DISTANCE_M,
     HEADLAND_TURN_RAD,
     HOME_MARKER_ID,
+    START_LOCALIZE_FROM_MARKER,
     SIGN_MARKER_LATERAL,
     furrow_marker_id,
+    furrow_index_from_marker,
     MAX_APPROACH_DURATION_SEC,
     MAX_CONSECUTIVE_STEP_ERRORS,
     MAX_FURROW_TRAVEL_DURATION_SEC,
@@ -103,9 +111,18 @@ from config import (
     WATER_LOW_ABORT_MIN_TRAVEL_M,
     MAX_HEADLAND_DURATION_SEC,
     MAX_HEADLAND_TRANSITS,
+    MARKER_POST_TILT_DEG,
+    MARKER_TILT_HEADING_MAX_CORRECTION_DEG,
+    MARKER_TILT_HEADING_MAX_DISTANCE_M,
+    USE_MARKER_TILT_FOR_FIELD_HEADING,
     MAX_SEARCH_RETRIES,
     MIN_INSIDE_FURROW_BEFORE_END_CHECK_SEC,
     REQUIRE_EXPLICIT_FIELD_END_MARKER,
+    MAX_STEER_CORRECTION,
+    SEARCH_CREEP_HEADING_GAIN,
+    SEARCH_CREEP_MAX_DISTANCE_M,
+    SEARCH_CREEP_SPEED,
+    SEARCH_MODE,
     SEARCH_ROTATE_SPEED,
     SEARCH_MAX_REVOLUTIONS,
     SEARCH_PULSE_ON_TICKS,
@@ -223,6 +240,12 @@ class MissionStateMachine:
         self._leg_start_len = 0.0
         self._gate_rejected_ticks = 0
         self._search_start_theta = 0.0
+        self._search_start_len = 0.0
+        # 탐색 2단계 진행 상태 (회전 -> 직선 전진 순서)
+        self._search_rotate_done = False
+        self._search_creep_exhausted = False
+        # 시작 고랑 번호를 팻말로 확정했는가 (임무 시작 시 1회)
+        self._start_localized = False
         # 밭 안쪽을 향하는 기준 방위. 입구 정렬을 마칠 때마다 갱신된다.
         self._field_heading = 0.0
 
@@ -280,6 +303,17 @@ class MissionStateMachine:
         if hasattr(self.odom, "is_available") and not self.odom.is_available():
             problems.append("엔코더 GPIO 초기화에 실패했습니다.")
 
+        from config import VISION_BACKEND
+        if (
+            VISION_BACKEND == "onnx_boundary"
+            and hasattr(self.vision_line, "available")
+            and not self.vision_line.available
+        ):
+            problems.append(
+                "ONNX 고랑선 모델을 열지 못했습니다: "
+                + str(getattr(self.vision_line, "last_error", "원인 불명"))
+            )
+
         if not problems:
             log.info("하드웨어 사전 점검 통과.")
             return True
@@ -298,14 +332,16 @@ class MissionStateMachine:
     # 하드웨어 컴포넌트 생성 (주입되지 않은 경우에만 호출됨)
     # ------------------------------------------------------------------
     def _make_odometry(self):
-        from sensors.odometry import Odometry
+        # ODOMETRY_BACKEND: "encoder" | "encoder_imu" (config 13-1 참고)
+        from sensors.odometry import create_odometry
 
-        return Odometry()
+        return create_odometry()
 
     def _make_motors(self):
-        from actuators.motor_driver import MotorDriver
+        # DRIVE_MODE: "open_loop" | "closed_loop" (config 13-2 참고)
+        from actuators.closed_loop_drive import create_drive
 
-        return MotorDriver(odometry=self.odom)
+        return create_drive(odometry=self.odom)
 
     def _make_pump(self):
         from actuators.pump_controller import PumpController
@@ -329,11 +365,32 @@ class MissionStateMachine:
         return ArucoDetector(self.camera)
 
     def _make_vision(self):
+        from config import VISION_BACKEND
+
+        if VISION_BACKEND == "onnx_boundary":
+            from sensors.onnx_furrow_line_detector import ONNXFurrowLineDetector
+
+            return ONNXFurrowLineDetector(self.camera)
+        if VISION_BACKEND == "ccrdnet":
+            from sensors.ccrdnet_line_detector import CCRDNetLineDetector
+
+            return CCRDNetLineDetector(self.camera)
+        if VISION_BACKEND != "hsv":
+            raise ValueError(f"지원하지 않는 VISION_BACKEND: {VISION_BACKEND}")
         from sensors.vision_line_detector import VisionLineDetector
 
         return VisionLineDetector(self.camera)
 
     def _make_water(self):
+        # WATER_SOURCE: "gpio"(IR 센서) | "nano_usb"(Nano 시리얼) — 인터페이스 동일
+        from config import WATER_SOURCE
+
+        if WATER_SOURCE == "nano_usb":
+            from sensors.nano_link import NanoWaterLink
+
+            return NanoWaterLink()
+        if WATER_SOURCE != "gpio":
+            raise ValueError(f"지원하지 않는 WATER_SOURCE: {WATER_SOURCE}")
         from sensors.water_tank_sensor import WaterTankSensor
 
         return WaterTankSensor()
@@ -480,6 +537,9 @@ class MissionStateMachine:
         for action in (
             lambda: self.motors.stop(),
             lambda: self.pump.turn_off(),
+            lambda: self.vision_line.cleanup()
+            if hasattr(self.vision_line, "cleanup")
+            else None,
             lambda: self.motors.cleanup(),
             lambda: self.pump.cleanup(),
             lambda: self.tof_pair.close(),
@@ -501,6 +561,12 @@ class MissionStateMachine:
             # 매 틱 정확히 1회 - 위치 추정과 센서 폴링은 여기서만
             self.odom.update()
             self.water_sensor.poll()
+            # [필수] 하위 제어기(아두이노 메가)는 400ms 무명령이면 스스로 멈춘다.
+            #   정지 중에도 매 틱 재전송해야 '연결 살아있음'과 '정지 명령'을
+            #   구분할 수 있다. 다른 구동 계층에는 이 메서드가 없으므로 선택 호출.
+            keepalive = getattr(self.motors, "keepalive", None)
+            if keepalive is not None:
+                keepalive()
             self.pump.tick()
 
             handler = {
@@ -535,9 +601,14 @@ class MissionStateMachine:
     def _state_init(self):
         self.motors.stop()
         self.pump.set_zone(False)
+        # IMU 오도메트리면 출발 전 정지 상태에서 자이로 바이어스를 실측한다.
+        if hasattr(self.odom, "calibrate"):
+            self.odom.calibrate()
         self.furrow_mgr.reset()
         self.target = NavigationTarget.NEXT_FURROW
         self._search_retry_count = 0
+        self._search_rotate_done = False
+        self._search_creep_exhausted = False
         self._approach_start_time = None
         self._vision_fallback_since = None
         self._transit_count = 0
@@ -545,8 +616,113 @@ class MissionStateMachine:
         # 로봇은 1번 고랑 입구(HOME)에서 밭 안쪽을 향해 놓인 상태로 시작한다고
         # 가정한다. 이 방위가 헤드랜드 이동의 기준이 된다.
         self._field_heading = self.odom.theta
+        # 시작 고랑 번호는 첫 탐색 중 보이는 팻말로 정한다(_maybe_localize_start).
+        # 마커는 연속 프레임 확인이 필요해서 INIT 단발 호출로는 잡히지 않는다.
+        self._start_localized = not START_LOCALIZE_FROM_MARKER
         log.info("임무 시작. 첫 고랑 입구를 탐색합니다.")
         self._goto(MissionState.SEARCH_AND_ALIGN)
+
+    def _furrow_center_target(self, obs):
+        """팻말 관측 -> **고랑 중심 입구**의 (횡오차, 전방거리).
+
+        팻말을 이랑 **중심**에 꽂고 이랑 간격을 측량값으로 알고 있으므로
+        (config 'FIELD SURVEY' 블록), 고랑 중심은 계산할 수 있다:
+
+            고랑 N 중심 = 이랑 N 팻말 - (간격 / 2)
+
+        이 보정이 없으면 로봇은 **팻말(=이랑 위)을 향해** 접근하게 되어
+        시작 위치가 조금만 벗어나도 고랑이 아니라 이랑으로 진입한다
+        (실측: 실패 14건 중 6건이 이 원인이고 완료 고랑 0개였다).
+
+        카메라 좌표계(x=오른쪽, z=전방) 기준으로 되돌려 준다.
+        시뮬 참값 대조에서 78/78 관측, 오차 0.00cm 로 검증했다.
+        """
+        heading_err = normalize_angle(self.odom.theta - self._field_heading)
+        # 월드에서 '고랑 쪽'(고랑 번호가 작아지는 쪽) 방향의 로봇 기준 베어링
+        bearing = math.pi / 2.0 - heading_err
+        # [중요] 옮기는 거리는 '간격/2'가 아니라 **측량된 실제 팻말 오프셋**이다.
+        #   팻말을 이랑 중심이 아닌 곳에 꽂았다면 간격/2 를 쓰면 그만큼 빗나간다.
+        shift = MARKER_POST_LATERAL_OFFSET_M
+        return (
+            obs.lateral_offset_m - math.sin(bearing) * shift,
+            obs.forward_m + math.cos(bearing) * shift,
+        )
+
+    def _field_heading_from_post(self, observed):
+        """팻말 **하나**로 밭 안쪽 방위를 유도한다 (설치 각도를 안다는 전제).
+
+            F = theta + b - yaw - tilt
+
+        팻말 2개가 동시에 보여야 하는 _reanchor_heading_from_posts 와 달리
+        1개면 되므로 훨씬 자주 쓸 수 있다. 대신 마커 yaw 추정에 의존하므로
+        거리/보정각 가드를 둔다(카메라 캘리브레이션 전제).
+        반환: 밭 안쪽 방위(rad) 또는 None.
+        """
+        if not USE_MARKER_TILT_FOR_FIELD_HEADING:
+            return None
+        best = None
+        for mid, obs in observed.items():
+            if mid < 1 or mid == FIELD_END_MARKER_ID:
+                continue
+            if obs.forward_m <= 0 or obs.distance_m > MARKER_TILT_HEADING_MAX_DISTANCE_M:
+                continue
+            if best is None or obs.distance_m < best.distance_m:
+                best = obs
+        if best is None:
+            return None
+        bearing_ccw = -math.atan2(best.lateral_offset_m, best.forward_m)
+        return normalize_angle(
+            self.odom.theta + bearing_ccw - best.yaw_error_rad
+            - math.radians(MARKER_POST_TILT_DEG)
+        )
+
+    def _maybe_localize_start(self, observed):
+        """임무 시작 직후, 보이는 팻말로 '지금 몇 번 고랑 앞인가'를 확정한다.
+
+        왜 필요한가
+          시작 위치는 현장에서 매번 달라진다. 이 보정이 없으면 로봇은 자기
+          위치와 무관하게 **무조건 1번 팻말**을 찾으므로, 조금만 옆에 놓아도
+          1번이 화각 밖이라 탐색에 실패하고 눈앞의 2번 팻말은 무시한다.
+          맵이 없는 시스템에서 팻말은 '지금 어디인가'를 아는 유일한 절대 기준이다.
+
+        1회만 수행한다(아직 고랑을 하나도 완료하지 않은 시점).
+        """
+        if self._start_localized or self.target != NavigationTarget.NEXT_FURROW:
+            return
+        if self.furrow_mgr.current_index != 0 or self.furrow_mgr.completed:
+            self._start_localized = True
+            return
+        located = self._localize_from_markers(observed)
+        if located is None:
+            return
+        self._start_localized = True
+
+        # [신규] 팻말 설치 각도를 알고 있으므로, 출발 자세를 가정하는 대신
+        #   팻말에서 밭 안쪽 방위를 직접 유도한다. 시작 헤딩이 조금 틀어져
+        #   있어도 이후 헤드랜드 이동이 어긋나지 않는다.
+        derived = self._field_heading_from_post(observed)
+        if derived is not None:
+            drift = normalize_angle(derived - self._field_heading)
+            if abs(drift) <= math.radians(MARKER_TILT_HEADING_MAX_CORRECTION_DEG):
+                self._field_heading = derived
+                if abs(drift) > math.radians(2.0):
+                    log.info("팻말 각도로 밭 방위를 %+.1f도 보정했습니다.",
+                             math.degrees(drift))
+            else:
+                log.warning("팻말 각도 기반 밭 방위 보정 %+.1f도는 상한(%.0f도)을 "
+                            "넘어 무시합니다.", math.degrees(drift),
+                            MARKER_TILT_HEADING_MAX_CORRECTION_DEG)
+        if located > 1:
+            # 1번보다 뒤에서 출발하면 그 사이 고랑은 급수 대상에서 빠진다.
+            log.warning(
+                "시작 위치가 %d번 고랑 앞입니다. 1~%d번 고랑은 이번 임무에서 "
+                "제외됩니다. 의도한 것이 아니면 0번 팻말 근처에서 출발하세요.",
+                located, located - 1,
+            )
+        else:
+            log.info("시작 위치 확인: %d번 고랑 앞.", located)
+        # current_index 는 '완료한 고랑 번호' 이므로 시작 고랑의 직전 값을 넣는다.
+        self.furrow_mgr.current_index = located - 1
 
     def _current_target_marker_id(self):
         """이번에 찾을 팻말 마커 ID (고랑당 입구 팻말 1개)."""
@@ -560,9 +736,18 @@ class MissionStateMachine:
 
         if self._consume_entry():
             self._search_start_theta = self.odom.theta
+            self._search_start_len = self.odom.path_length
 
-        target_id = self._current_target_marker_id()
         observed = self.aruco.detect()
+        self._maybe_localize_start(observed)
+        # [신규] 팻말 2개가 동시에 보이면 그 두 점을 잇는 선이 곧 헤드랜드
+        #   방향이므로, 밭 기준 방위를 **절대값으로** 다시 잡을 수 있다.
+        #   IMU 가 없는 구성에서 엔코더 회전 오차를 지우는 유일한 수단인데,
+        #   예전에는 HOME 복귀 경로에서만 호출되어 급수 주행 내내 한 번도
+        #   보정되지 않았다. 여기서도 매 탐색 틱마다 시도한다.
+        #   (함수 안에 베이스라인/거리/최대보정각 가드가 이미 있다)
+        self._reanchor_heading_from_posts(observed)
+        target_id = self._current_target_marker_id()
 
         # ---------------- END 마커 ----------------
         # [수정/치명적] END 마커의 의미를 바로잡는다.
@@ -606,6 +791,14 @@ class MissionStateMachine:
             candidate.heading_error = normalize_angle(
                 self.odom.theta - self._field_heading
             )
+            # [신규] 팻말은 이랑 중심에 있다. 접근 목표를 팻말이 아니라
+            #   **고랑 중심**으로 옮긴다(밭 측량값을 알고 있으므로 계산 가능).
+            #   [주의] forward_distance 는 건드리지 않는다. 그 값은 '도착
+            #   판정'(ENTRANCE_ENTER_DISTANCE_M)에 쓰이는데, 함께 옮기면
+            #   정렬이 엉뚱한 지점에서 끝나 **펌프가 고랑 밖에서 켜진다**
+            #   (실측: 인터록 위반 6~7회). 조향에 쓰는 횡오차만 옮긴다.
+            if MARKER_ON_RIDGE_CENTER:
+                candidate.lateral_error = self._furrow_center_target(post_obs)[0]
             if not candidate.valid:
                 reject_reason = "팻말을 너무 가까이/비스듬히 보고 있음"
             elif abs(candidate.heading_error) > ENTRANCE_MAX_APPROACH_HEADING_RAD:
@@ -622,7 +815,7 @@ class MissionStateMachine:
             self.motors.stop()
             if self._gate_rejected_ticks == 1:
                 log.warning(
-                    "입구 마커(id=%s,%s)는 보이지만 접근할 수 없습니다: %s",
+                    "입구 마커(id=%s)는 보이지만 접근할 수 없습니다: %s",
                     target_id, reject_reason,
                 )
             # 제자리에서 더 찾아봐야 소용없다. 헤드랜드로 위치를 옮긴다.
@@ -665,19 +858,44 @@ class MissionStateMachine:
             self._approach_start_time = None
             self._pulse_scan()
 
-            # 시간 상한과 회전량 상한 중 먼저 걸리는 쪽으로 종료한다.
-            rotated = abs(self.odom.theta - self._search_start_theta)
-            swept_enough = rotated >= 2.0 * math.pi * SEARCH_MAX_REVOLUTIONS
+            # 시간 상한과 "충분히 훑었는가" 중 먼저 걸리는 쪽으로 종료한다.
+            #   직선 탐색: 전진 거리 상한,  회전 탐색: 회전량 상한
+            if self._search_phase() == "creep":
+                swept_enough = (
+                    self._search_creep_distance() >= SEARCH_CREEP_MAX_DISTANCE_M
+                )
+            else:
+                rotated = abs(self.odom.theta - self._search_start_theta)
+                swept_enough = rotated >= 2.0 * math.pi * SEARCH_MAX_REVOLUTIONS
             if self._elapsed_in_state() <= SEARCH_TIMEOUT_SEC and not swept_enough:
                 return
 
             self.motors.stop()
-            self._search_retry_count += 1
             self._search_start_theta = self.odom.theta
+            self._search_start_len = self.odom.path_length
+
+            # 단계 전환: 회전으로 못 찾으면 직선 전진, 그것도 실패하면 재시도.
+            # (단계 전환은 재시도 카운트를 소비하지 않는다)
+            phase = self._search_phase()
+            if phase == "rotate" and SEARCH_MODE == "rotate_then_creep"                     and not self._search_rotate_done:
+                self._search_rotate_done = True
+                log.info("제자리 회전으로 팻말을 찾지 못했습니다. "
+                         "직선 %.1fm 전진 탐색으로 전환합니다.",
+                         SEARCH_CREEP_MAX_DISTANCE_M)
+                self._goto(MissionState.SEARCH_AND_ALIGN)
+                return
+            if phase == "creep":
+                self._search_creep_exhausted = True
+                log.info("직선 탐색 %.1fm 동안 팻말을 찾지 못했습니다.",
+                         SEARCH_CREEP_MAX_DISTANCE_M)
+                self._goto(MissionState.SEARCH_AND_ALIGN)
+                return
+
+            self._search_retry_count += 1
 
             if self._search_retry_count <= MAX_SEARCH_RETRIES:
                 log.warning(
-                    "마커(id=%s,%s) 탐색 실패 %d회. 재탐색합니다.",
+                    "마커(id=%s) 탐색 실패 %d회. 재탐색합니다.",
                     target_id, self._search_retry_count,
                 )
                 self._goto(MissionState.SEARCH_AND_ALIGN)
@@ -810,7 +1028,16 @@ class MissionStateMachine:
         # 헤드랜드에서 켜진다. 중심을 유지한 채 입구까지 다가간다.
         # (거리 조건일 뿐, '마커-중심선 거리' 같은 사전 지식이 아니다)
         walls_seen = self.tof_pair.walls_visible()
-        if align.forward_distance > ENTRANCE_ENTER_DISTANCE_M and not walls_seen:
+        # [수정] 팻말이 고랑 중심선에서 멀리(이랑 중심) 있으면 '마커까지의
+        #   거리'만으로 도착을 판정할 수 없다. ToF 로 좌우 벽을 실제로 본
+        #   뒤에야 진입을 확정한다(그 전까지는 중심을 유지하며 계속 전진).
+        #   벽을 끝내 못 보면 MAX_APPROACH_DURATION_SEC 로 SAFE_HALT 된다.
+        too_far = align.forward_distance > ENTRANCE_ENTER_DISTANCE_M
+        if ENTRANCE_REQUIRE_WALLS_BEFORE_ENTER:
+            keep_approaching = not walls_seen
+        else:
+            keep_approaching = too_far and not walls_seen
+        if keep_approaching:
             steer = self._align_pid_lateral.compute(centre_error)
             steer = max(-ALIGN_SPEED * 0.8, min(ALIGN_SPEED * 0.8, steer))
             self.motors.drive(ALIGN_SPEED, steer)
@@ -932,14 +1159,59 @@ class MissionStateMachine:
         # (d) 아직 아무것도 안 보인다 -> 곧게 조금 더 전진
         self.motors.drive(speed, 0.0)
 
-    def _pulse_scan(self):
+    def _search_phase(self) -> str:
+        """지금 탐색 단계가 '회전'인가 '직선 전진'인가.
+
+        기본 정책(rotate_then_creep): **회전을 먼저** 한다. 팻말은 전부
+        헤드랜드선에 있고 로봇은 밭쪽을 보고 출발하므로, 직선 전진은
+        마커선에서 멀어진다. 회전으로 화각을 훑어도 못 찾을 때만 이동한다.
         """
-        제자리 탐색 회전. 계속 돌지 않고 "조금 돌고 -> 멈춰서 촬영"을 반복한다.
-        데드밴드 때문에 회전 속도를 낮출 수 없어서, 계속 돌면 모션 블러로
-        마커가 잘 안 잡힌다. 멈춘 틱에 찍은 프레임은 블러가 없다.
+        if SEARCH_MODE == "creep":
+            return "rotate" if self._search_creep_exhausted else "creep"
+        if SEARCH_MODE == "rotate_then_creep":
+            if self._search_rotate_done and not self._search_creep_exhausted:
+                return "creep"
+            return "rotate"
+        return "rotate"
+
+    def _moving_pulse(self) -> bool:
+        """이번 틱이 '움직이는 구간'인가.
+
+        계속 움직이면 모션 블러로 마커가 잘 안 잡힌다(데드밴드 때문에 속도를
+        더 낮출 수도 없다). "조금 움직이고 -> 멈춰서 촬영"을 반복해서
+        멈춘 틱의 프레임으로 마커를 검출한다.
         """
         period = max(1, SEARCH_PULSE_ON_TICKS + SEARCH_PULSE_OFF_TICKS)
-        if self._tick % period < SEARCH_PULSE_ON_TICKS:
+        return self._tick % period < SEARCH_PULSE_ON_TICKS
+
+    def _search_creep_distance(self) -> float:
+        """이번 탐색에서 직선으로 전진한 거리(m)."""
+        return self.odom.path_length - self._search_start_len
+
+    def _pulse_scan(self):
+        """탐색 동작 1틱.
+
+        SEARCH_MODE="creep" (기본, 운용 시퀀스):
+            밭 방위(_field_heading)를 유지하며 **직선으로 조금씩 전진**하면서
+            마커를 찾는다. 팻말은 진행 방향 앞쪽에 있으므로 제자리에서 도는
+            것보다 이쪽이 먼저 찾는다. SEARCH_CREEP_MAX_DISTANCE_M 만큼
+            전진하면 종료되고, 재시도 때는 아래 회전 탐색으로 넘어간다.
+        SEARCH_MODE="rotate" (또는 직선 탐색 소진 후):
+            제자리 회전 탐색. 옆/뒤쪽 팻말까지 훑는다.
+        """
+        if self._search_phase() == "creep":
+            if not self._moving_pulse():
+                self.motors.stop()
+                return
+            # 직진 중 헤딩이 틀어지면 고랑을 가로지르게 되므로 방위를 잡아준다.
+            heading_error = normalize_angle(self.odom.theta - self._field_heading)
+            steer = max(-MAX_STEER_CORRECTION, min(
+                MAX_STEER_CORRECTION, SEARCH_CREEP_HEADING_GAIN * heading_error
+            ))
+            self.motors.drive(SEARCH_CREEP_SPEED, steer)
+            return
+
+        if self._moving_pulse():
             self.motors.rotate_in_place(clockwise=True, speed=SEARCH_ROTATE_SPEED)
         else:
             self.motors.stop()
@@ -1000,10 +1272,15 @@ class MissionStateMachine:
         고랑 내부 주행 공통 로직.
         반환: 고랑 끝(또는 입구)에 도달했으면 True.
 
-        [신규] ToF 타당성 검사
-          - 진입 후 FURROW_WALL_ACQUIRE_SEC 안에 좌우 벽을 한 번도 못 보면
-            ToF 고장으로 보고 SAFE_HALT (예전에는 이 상황에서 짧은 왕복을
-            반복하며 물도 안 주고 "임무 완료"로 끝났다).
+        ToF 타당성 검사
+          - ToF 는 **진입 첫 틱부터** 매 틱 읽는다(line_follower.step 안에서).
+            아래 유예값은 '언제부터 보는가'가 아니라 '언제 포기하는가'다.
+          - 좌우 벽을 한 번도 못 본 채 FURROW_WALL_ACQUIRE_SEC(시간) 또는
+            FURROW_WALL_ACQUIRE_MAX_TRAVEL_M(거리) 중 **먼저 걸리는 쪽**에
+            도달하면 SAFE_HALT (예전에는 이 상황에서 짧은 왕복을 반복하며
+            물도 안 주고 "임무 완료"로 끝났다).
+          - 거리 기준을 함께 두는 이유: 시간만 보면 "천천히 정렬하며 진입하는
+            정상 동작"과 "벽 없는 곳을 계속 달리는 고장"을 구분하지 못한다.
           - 최소 주행 거리(MIN_FURROW_TRAVEL_DISTANCE_M) 전의 '고랑 끝'
             신호는 받아들이지 않는다.
         """
@@ -1016,17 +1293,23 @@ class MissionStateMachine:
             self._walls_seen = True
 
         elapsed = self._elapsed_in_state()
+        travelled = self.odom.path_length - self._leg_start_len
 
-        if not self._walls_seen and elapsed > FURROW_WALL_ACQUIRE_SEC:
+        # [수정] 시간뿐 아니라 **주행 거리**로도 끊는다. 시간만 보면
+        #   "천천히 정렬하며 진입하는 정상 동작"과 "벽 없는 곳을 계속 달리는
+        #   고장"을 구분하지 못한다. 둘 중 먼저 걸리는 쪽에서 정지.
+        if not self._walls_seen and (
+            elapsed > FURROW_WALL_ACQUIRE_SEC
+            or travelled > FURROW_WALL_ACQUIRE_MAX_TRAVEL_M
+        ):
             self.motors.stop()
             self._safe_halt(
-                f"고랑 주행 시작 후 {FURROW_WALL_ACQUIRE_SEC:.0f}초 동안 "
+                f"고랑 주행 시작 후 {elapsed:.1f}초 / {travelled:.2f}m 동안 "
                 f"좌우 이랑 벽을 한 번도 감지하지 못했습니다. ToF 배선/주소 설정 "
                 f"오류이거나 고랑이 아닌 곳에 진입했을 수 있습니다."
             )
             return False
 
-        travelled = self.odom.path_length - self._leg_start_len
         if travelled < MIN_FURROW_TRAVEL_DISTANCE_M:
             return False
 
@@ -1285,6 +1568,20 @@ class MissionStateMachine:
         """
         new_heading = normalize_angle(self.odom.theta + math.pi)
         drift = normalize_angle(new_heading - self._field_heading)
+
+        # [신규/중요] 검증 없이 채택하면 안 된다. 이 재기준은 "고랑을 따라
+        #   똑바로 빠져나왔다"를 전제하는데, 비전이 로봇을 비스듬히 내보내면
+        #   그 **틀린 각도까지 밭 기준이 되어** 이후 헤드랜드 이동이 통째로
+        #   어긋난다(실측 중앙 드리프트 40도). 상식적인 범위를 넘으면 버린다.
+        limit = math.radians(FIELD_HEADING_REANCHOR_MAX_DRIFT_DEG)
+        if limit > 0 and abs(drift) > limit:
+            log.warning(
+                "밭 방위 재기준 %+.1f도는 상한(%.0f도)을 넘어 무시합니다. "
+                "고랑을 비스듬히 빠져나왔을 가능성이 큽니다.",
+                math.degrees(drift), FIELD_HEADING_REANCHOR_MAX_DRIFT_DEG,
+            )
+            return
+
         self._field_heading = new_heading
         if abs(drift) > math.radians(3.0):
             log.info(
@@ -1382,6 +1679,9 @@ class MissionStateMachine:
     def _start_headland_transit(self):
         self._transit_phase = TransitPhase.TURN_OUT
         self._transit_count += 1
+        # 위치가 바뀌므로 다음 탐색은 1단계(회전)부터 다시 시작한다.
+        self._search_rotate_done = False
+        self._search_creep_exhausted = False
         self._goto(MissionState.HEADLAND_TRANSIT)
 
     def _state_headland_transit(self):
@@ -1390,6 +1690,12 @@ class MissionStateMachine:
         회전은 모두 **절대 방위 목표**로 계산하므로 시작 자세와 무관하다.
         모든 단계에 거리/시간 상한이 있다.
         """
+        # [신규] 헤드랜드를 옆으로 지나가는 동안은 여러 고랑의 팻말이 한 화면에
+        #   들어올 가능성이 가장 높다. IMU 가 없는 구성에서 밭 기준 방위를
+        #   절대값으로 다시 잡을 수 있는 몇 안 되는 기회이므로 여기서도 시도한다.
+        #   (선회 오차가 누적되는 바로 그 구간이라 효과가 크다)
+        if HEADLAND_ANCHOR_HEADING:
+            self._reanchor_heading_from_posts(self._safe_detect())
         # [신규/방어] 어떤 분기에도 걸리지 않는 상태를 그냥 두면 아무 일도
         #   하지 않는 무한 루프가 된다. 실제로 이 자리에서 NameError 가
         #   매 틱 발생했는데, 다음 틱에는 예외가 안 나서 연속 예외 카운터가
@@ -1583,7 +1889,7 @@ class MissionStateMachine:
             # 입구 팻말 ID = 고랑 번호. END(249)는 고랑 번호가 아니므로 제외.
             if mid < 1 or mid == FIELD_END_MARKER_ID:
                 continue
-            idx = mid
+            idx = furrow_index_from_marker(mid)
             # 여러 개가 보이면 가장 가까운 것을 신뢰한다
             if obs.distance_m < best_dist:
                 best_idx, best_dist = idx, obs.distance_m

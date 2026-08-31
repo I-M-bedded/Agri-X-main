@@ -48,6 +48,8 @@ from config import (
     USE_VISION_LINE_FOLLOWING,
     VISION_HEADING_WEIGHT,
     VISION_MIN_CONFIDENCE,
+    VISION_TOF_DISAGREE_LIMIT,
+    VISION_TRUST_FULL_CONFIDENCE,
 )
 from control.pid_controller import PIDController
 from config import (
@@ -75,8 +77,23 @@ class LineFollowResult:
     left_mm: float
     right_mm: float
     cross_check_ok: bool        # 비전과 ToF 판단이 서로 모순되지 않는가
+    vision_weight: float = 0.0  # 이번 틱에 비전에 준 가중치 (0=순수 ToF)
+    vision_vetoed: bool = False # ToF 와 크게 어긋나 비전을 폐기했는가
 
 
+
+
+def vision_trust_weight(confidence: float) -> float:
+    """비전 신뢰도 -> 비전 가중치(0.0 ~ 1-TOF_ASSIST_WEIGHT).
+
+    게이트(VISION_MIN_CONFIDENCE)에서 0 -> 순수 ToF 와 같아지고,
+    VISION_TRUST_FULL_CONFIDENCE 이상에서 최대가 된다.
+    "비전은 신뢰도가 높을 때만 주도권을 갖는다" 는 정책의 구현부.
+    """
+    span = VISION_TRUST_FULL_CONFIDENCE - VISION_MIN_CONFIDENCE
+    ratio = 1.0 if span <= 0 else (confidence - VISION_MIN_CONFIDENCE) / span
+    ratio = max(0.0, min(1.0, ratio))
+    return ratio * (1.0 - TOF_ASSIST_WEIGHT)
 
 
 class LineFollower:
@@ -150,18 +167,43 @@ class LineFollower:
         # --- 오차 선택: 비전 > ToF > 헤딩유지 ---
         # [수정] 마커가 입구에만 있으므로 고랑 안에서는 인공 표식이 없다.
         #   중심선 추종은 전적으로 비전과 ToF 가 담당한다.
+        # [수정] 예전에는 게이트만 넘으면 신뢰도와 무관하게 비전에 75% 를 고정
+        #   배분했다. 그래서 신뢰도 0.26 짜리 오답도 조향을 지배했고, ToF 25%
+        #   로는 지워지지 않았다(실측 오차 주입 시 완주율 6.7%).
+        #   이제 (a) ToF 와 크게 어긋나면 비전을 폐기하고,
+        #        (b) 살아남아도 신뢰도에 비례한 가중치만 준다.
+        vision_weight = 0.0
+        vision_vetoed = False
+
+        # (a) 거부권: 물리량을 직접 재는 ToF 가 비전 오답을 걸러낸다.
+        #     비전이 옆 고랑을 잡으면 오차가 통째로 어긋나므로 여기서 걸린다.
+        if (
+            using_vision
+            and tof_valid
+            and VISION_TOF_DISAGREE_LIMIT > 0
+            and abs(vision_error - tof_error) > VISION_TOF_DISAGREE_LIMIT
+        ):
+            using_vision = False
+            vision_vetoed = True
+
         if using_vision:
-            error = vision_error
-            # 비전으로 잘 가고 있을 때의 헤딩을 기준각으로 갱신
-            if self.odom is not None:
-                self._target_heading = self.odom.theta
-            # ToF 가 유효하면 살짝 섞어 좌우 대칭도 함께 맞춘다.
-            # 비전은 흙 무늬를, ToF 는 실제 벽 거리를 보므로 서로 보완한다.
             if tof_valid:
+                # (b) 신뢰도 비례 배분. 게이트 턱걸이 = 사실상 순수 ToF.
+                vision_weight = vision_trust_weight(vision_confidence)
                 error = (
-                    (1.0 - TOF_ASSIST_WEIGHT) * error
-                    + TOF_ASSIST_WEIGHT * tof_error
+                    vision_weight * vision_error
+                    + (1.0 - vision_weight) * tof_error
                 )
+            else:
+                # ToF 를 못 쓰면 비전이 유일한 근거다.
+                vision_weight = 1.0
+                error = vision_error
+            # [중요] 헤딩 기준각은 **비전이 실제로 주도권을 가졌을 때만** 갱신한다.
+            #   예전에는 게이트만 넘으면 매 틱 갱신했다. 그래서 비전이 로봇을
+            #   틀린 방향으로 몰고 가는 동안에도 그 헤딩을 "옳다"고 저장했고,
+            #   나중에 비전이 끊겨 폴백할 때 이미 틀어진 각을 목표로 유지했다.
+            if self.odom is not None and vision_weight >= 0.5:
+                self._target_heading = self.odom.theta
         else:
             # 폴백: ToF(유효할 때) + 엔코더 헤딩 유지
             error = tof_error if tof_valid else 0.0
@@ -217,4 +259,6 @@ class LineFollower:
             left_mm=left_mm,
             right_mm=right_mm,
             cross_check_ok=cross_check_ok,
+            vision_weight=vision_weight,
+            vision_vetoed=vision_vetoed,
         )

@@ -1,0 +1,7 @@
+name,gt_ok,pred_ok,angle_error,lateral_near,lateral_far,line_iou,nav_iou,confidence,accurate
+trajectory01_RGB_017_VIDSET_20260513_062211_realsense_color_frame_000559,True,False,nan,nan,nan,nan,0.0000,0.000,False
+trajectory01_RGB_018_VIDSET_20260513_062211_realsense_color_frame_000709,True,False,nan,nan,nan,nan,0.0000,0.000,False
+trajectory01_RGB_019_VIDSET_20260513_063117_realsense_color_frame_000045,True,False,nan,nan,nan,nan,0.0000,0.000,False
+trajectory03_RGB_018_VIDSET_20260513_075637_realsense_color_frame_001206,True,False,nan,nan,nan,nan,0.0000,0.000,False
+trajectory03_RGB_019_VIDSET_20260513_075637_realsense_color_frame_001458,False,False,nan,nan,nan,nan,nan,0.000,False
+trajectory03_RGB_020_VIDSET_20260513_075637_realsense_color_frame_001709,True,True,16.0870,12.28,14.51,0.0492,0.0017,0.066,False

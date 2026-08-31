@@ -32,6 +32,7 @@ farm_robot/
 ├── logutil.py                 공용 로거 (11개 모듈이 임포트 - 지우면 안 됨)
 ├── selftest.py                자체 점검 (150개 항목)
 ├── OVERVIEW.md                처음 보는 사람용 전체 설명서
+├── VISION_NAVIGATION_REVIEW.md  SegFormer 중심선·FSM·HOME 연동 검토
 ├── WIRING.md                  배선도 (핀 번호 + 외부 결선 전체)
 │
 ├── sensors/                   센서 읽기
@@ -40,6 +41,9 @@ farm_robot/
 │   ├── odometry.py                엔코더 → 위치/각도 추정
 │   ├── aruco_detector.py          마커 → 입구 위치/진입각
 │   ├── vision_line_detector.py    영상 → 고랑 중앙선 오차
+│   ├── onnx_furrow_line_detector.py  비동기 SegFormer ONNX 어댑터
+│   ├── ccrdnet_line_detector.py   비동기 CCRDNet 3-클래스 어댑터 (CONTROL_PIPELINE.md)
+│   ├── furrow_geometry.py         line mask → Hough 중심선
 │   └── water_tank_sensor.py       수위 (디바운스)
 │
 ├── actuators/                 물리 출력

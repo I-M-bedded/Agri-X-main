@@ -1,0 +1,6 @@
+newmtl soil
+Ka 0.400 0.320 0.240
+Kd 0.700 0.580 0.450
+Ks 0.000 0.000 0.000
+Ns 1
+map_Kd ../ground_textures/soil_pilot.png

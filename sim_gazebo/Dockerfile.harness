@@ -1,0 +1,9 @@
+# 하네스용 이미지: Gazebo + OpenCV + gz-transport Python 바인딩
+#   컨테이너 밖에서 docker exec 로 gz topic 을 부르면 호출당 1초씩 걸려
+#   20Hz 제어 루프가 불가능하다. 루프를 컨테이너 안에서 돌린다.
+FROM agrix-gazebo:harmonic
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3-opencv python3-numpy \
+        python3-gz-transport13 python3-gz-msgs10 \
+    && rm -rf /var/lib/apt/lists/*

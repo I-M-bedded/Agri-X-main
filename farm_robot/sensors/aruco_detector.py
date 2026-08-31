@@ -85,6 +85,21 @@ class ArucoDetector:
             params = cv2.aruco.DetectorParameters()
             # 야외 역광/그림자에 강하도록 서브픽셀 코너 보정 사용
             params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+
+            # [실측 튜닝] Gazebo 렌더 프레임(640x480, 10cm 마커, 거리 2.1m,
+            #   화면상 약 25px)에서 **기본 파라미터로는 검출 0건**이었다.
+            #   2배 확대하면 검출되므로 원인은 해상도이고, 아래 세 값을
+            #   낮추면 원본 해상도에서도 검출된다.
+            #     minMarkerPerimeterRate      작은 마커를 후보에서 버리지 않게
+            #     perspectiveRemovePixelPerCell 셀당 샘플 수를 줄여 저해상도 대응
+            #     polygonalApproxAccuracyRate  코너 근사 허용오차 완화
+            #   ※ 너무 낮추면 오검출이 늘어난다. 실기 영상으로 재확인할 것.
+            params.minMarkerPerimeterRate = 0.01
+            params.adaptiveThreshWinSizeMin = 3
+            params.adaptiveThreshWinSizeMax = 15
+            params.adaptiveThreshWinSizeStep = 2
+            params.perspectiveRemovePixelPerCell = 8
+            params.polygonalApproxAccuracyRate = 0.05
             self._detector = cv2.aruco.ArucoDetector(aruco_dict, params)
         else:  # OpenCV < 4.7
             self._legacy = True

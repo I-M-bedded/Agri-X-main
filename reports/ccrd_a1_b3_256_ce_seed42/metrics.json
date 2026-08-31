@@ -1,0 +1,41 @@
+{
+  "frames_total": 400,
+  "frames_with_gt_line": 400,
+  "frames_with_pred_line": 400,
+  "detection_rate": 1.0,
+  "angle_error_deg": {
+    "mean": 0.7800975448386663,
+    "median": 0.39960936185980506,
+    "p95": 3.054579604132688,
+    "n": 400
+  },
+  "lateral_near_px": {
+    "mean": 1.788286619167525,
+    "median": 0.8696679799715881,
+    "p95": 6.594373900577522,
+    "n": 400
+  },
+  "lateral_far_px": {
+    "mean": 0.9563168098782728,
+    "median": 0.5949573261877745,
+    "p95": 3.315698710543051,
+    "n": 400
+  },
+  "line_iou": {
+    "mean": 0.7264030736878092,
+    "median": 0.7555770435083056,
+    "p95": 1.0,
+    "n": 400
+  },
+  "nav_mask_iou": {
+    "mean": 0.6757876324973853,
+    "median": 0.738202967010914,
+    "p95": 0.858472267710559,
+    "n": 400
+  },
+  "line_accuracy": 0.975,
+  "accuracy_criterion": "AE<=5.0deg AND lateral_near<=10.0px",
+  "checkpoint": "C:\\Users\\JUN\\Documents\\Agri-X-main\\runs\\ccrd_a1_b3_256_ce_seed42\\best.pt",
+  "checkpoint_epoch": 52,
+  "split": "test"
+}

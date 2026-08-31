@@ -28,7 +28,11 @@ from config import (
     furrow_marker_id,
     FIELD_END_MARKER_ID,
     MARKER_POST_LATERAL_OFFSET_M,
+    FIELD_ROW_SPACING_M,
     MARKER_POST_TILT_DEG,
+    MARKER_SIZE_M,
+    MARKER_PAIR_PER_FURROW,
+    MARKER_PAIR_SPACING_M,
     HOME_MARKER_ID,
 )
 from sensors.aruco_detector import MarkerObservation
@@ -66,7 +70,7 @@ class SimWorld:
     # 물리 파라미터
     MAX_WHEEL_SPEED_MPS = 0.5      # 속도 명령 1.0 일 때의 바퀴 선속도
     FURROW_LENGTH_M = 3.0
-    FURROW_SPACING_M = 1.0
+    FURROW_SPACING_M = FIELD_ROW_SPACING_M   # config 측량값과 일치시킨다
     FURROW_HALF_WIDTH_M = TOF_NOMINAL_WALL_DISTANCE_MM / 1000.0
     ENTRANCE_MARGIN_M = 0.4        # 입구 앞 이 범위까지는 이랑 벽이 있다고 본다
     MARKER_RANGE_M = 3.0
@@ -111,6 +115,7 @@ class SimWorld:
         self._dist_per_tick = (2 * math.pi * WHEEL_RADIUS_M) / TICKS_PER_REVOLUTION
 
         self.total_time = 0.0
+        self.last_omega = 0.0   # SimImu 용 실제 각속도(rad/s)
         self.furrows_watered = 0
         self._was_inside = False
 
@@ -130,16 +135,29 @@ class SimWorld:
         off = MARKER_POST_LATERAL_OFFSET_M
         facing = -math.pi / 2 + math.radians(MARKER_POST_TILT_DEG)
 
-        for k in range(1, self.n_furrows + 1):
-            cx = (k - 1) * self.FURROW_SPACING_M
-            m[furrow_marker_id(k)] = (cx + off, 0.0, facing)
-
-        # HOME = 1번 고랑 입구 팻말과 같은 자리
-        m[HOME_MARKER_ID] = (off, 0.0, facing)
+        if MARKER_PAIR_PER_FURROW:
+            # 고랑당 좌/우 2개. x 순서와 ID 순서가 일치해야 한다.
+            half = MARKER_PAIR_SPACING_M / 2.0
+            for k in range(1, self.n_furrows + 1):
+                cx = (k - 1) * self.FURROW_SPACING_M
+                m[2 * k - 1] = (cx - half, 0.0, facing)   # 좌
+                m[2 * k] = (cx + half, 0.0, facing)       # 우
+            # HOME 은 1번 고랑 좌측 팻말과 같은 자리
+            m[HOME_MARKER_ID] = (0.0 - half, 0.0, facing)
+        else:
+            for k in range(1, self.n_furrows + 1):
+                cx = (k - 1) * self.FURROW_SPACING_M
+                m[furrow_marker_id(k)] = (cx + off, 0.0, facing)
+            # HOME 은 1번 고랑 입구 팻말에 **나란히** 붙인다.
+            # [중요] 정확히 같은 좌표에 두면 두 마커가 화면에서 겹쳐 그려져
+            #   서로의 패턴을 망가뜨린다(실제 렌더링으로 확인). 실기에서도
+            #   같은 팻말에 두 장을 붙이면 옆으로 나란히 붙지 겹치지 않는다.
+            m[HOME_MARKER_ID] = (off + MARKER_SIZE_M * 1.5, 0.0, facing)
 
         # END 마커는 **마지막 고랑의 입구 팻말**에 함께 붙인다.
         last_cx = (self.n_furrows - 1) * self.FURROW_SPACING_M
-        m[FIELD_END_MARKER_ID] = (last_cx + off, 0.0, facing)
+        end_off = (MARKER_PAIR_SPACING_M / 2.0) if MARKER_PAIR_PER_FURROW else off
+        m[FIELD_END_MARKER_ID] = (last_cx + end_off, 0.0, facing)
         return m
 
     # ------------------------------------------------------------------
@@ -177,6 +195,8 @@ class SimWorld:
         self.x += d_center * math.cos(mid)
         self.y += d_center * math.sin(mid)
         self.theta += d_theta
+        # 실제로 돈 각속도. 엔코더는 미끄러짐을 모르지만 자이로는 이걸 본다.
+        self.last_omega = d_theta / dt if dt > 0 else 0.0
 
         # 엔코더 틱 주입 (소수부는 다음 스텝으로 이월)
         if self.odom is not None:
@@ -297,7 +317,12 @@ class SimWorld:
                 distance_m=dist,
                 forward_m=cam_z,
                 lateral_offset_m=cam_x,
-                yaw_error_rad=bearing_right,
+                # [수정] 실기 ArucoDetector 와 같은 의미로 맞춘다.
+                #   실기: atan2(R[0,2], R[2,2]) = 마커 법선과 '마커->카메라'
+                #   방향 사이의 부호 있는 각(정면에서 보면 0).
+                #   기존에는 bearing_right(마커의 화면상 좌우 위치)를 넣고
+                #   있어서 의미가 전혀 달랐다.
+                yaw_error_rad=face_off,
             )
         return out
 
@@ -407,6 +432,30 @@ class SimCamera:
 
     def close(self):
         pass
+
+
+class SimImu:
+    """시뮬레이션 IMU (MPU6050Yaw 와 같은 계약).
+
+    엔코더는 '궤도가 돈 양'을 보고 미끄러짐을 모르지만, 자이로는 **실제로
+    돈 각도**를 본다. 그래서 미끄러짐이 있을 때만 IMU 의 값어치가 드러난다.
+    bias_rad_s 로 자이로 바이어스(실기의 주 오차원)를 흉내낼 수 있다.
+    """
+
+    def __init__(self, world, bias_rad_s: float = 0.0):
+        self.world = world
+        self.available = True
+        self.bias_rad_s = bias_rad_s
+
+    def read_yaw_rate(self) -> float:
+        return self.world.last_omega + self.bias_rad_s
+
+    def calibrate_bias(self, duration_sec: float = 0.0):
+        # 정지 상태에서 측정하므로 시뮬에서는 바이어스가 그대로 추정된다
+        self.bias_rad_s = 0.0
+
+    def cleanup(self):
+        self.available = False
 
 
 class SimWaterSensor:

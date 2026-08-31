@@ -1,0 +1,41 @@
+{
+  "frames_total": 6,
+  "frames_with_gt_line": 5,
+  "frames_with_pred_line": 1,
+  "detection_rate": 0.2,
+  "angle_error_deg": {
+    "mean": 16.08696004331812,
+    "median": 16.08696004331812,
+    "p95": 16.08696004331812,
+    "n": 1
+  },
+  "lateral_near_px": {
+    "mean": 12.28469959065481,
+    "median": 12.28469959065481,
+    "p95": 12.28469959065481,
+    "n": 1
+  },
+  "lateral_far_px": {
+    "mean": 14.513248648066991,
+    "median": 14.513248648066991,
+    "p95": 14.513248648066991,
+    "n": 1
+  },
+  "line_iou": {
+    "mean": 0.04924565898092798,
+    "median": 0.04924565898092798,
+    "p95": 0.04924565898092798,
+    "n": 1
+  },
+  "nav_mask_iou": {
+    "mean": 0.0003454231433506045,
+    "median": 0.0,
+    "p95": 0.0013816925734024175,
+    "n": 5
+  },
+  "line_accuracy": 0.0,
+  "accuracy_criterion": "AE<=5.0deg AND lateral_near<=10.0px",
+  "checkpoint": "C:\\Users\\JUN\\Documents\\Agri-X-main\\runs\\pilot_ft_seed42\\best.pt",
+  "checkpoint_epoch": 39,
+  "split": "val"
+}
