@@ -2,28 +2,32 @@
 """
 actuators/pump_controller.py
 -----------------------------
-펌프는 전압이 인가되는 순간 바로 작동하므로,
-"고랑 밖에서는 절대 켜지지 않도록" 소프트웨어 인터록을 강제한다.
+워터펌프는 LR7843 N-MOSFET 모듈로 스위칭한다.
 
-이전 버전 대비 수정 사항
-  1) tick() 추가 - 매 제어 주기마다 릴레이 상태를 다시 확정(re-assert)한다.
-     외부 노이즈나 코드 경로 누락으로 상태가 어긋나는 것을 막는 방어 코드.
-  2) 최대 연속 가동 시간 워치독(PUMP_MAX_CONTINUOUS_SEC) 추가.
-     상위 로직이 어떤 이유로든 OFF를 못 부른 경우의 마지막 방어선.
-  3) 물 부족(water_low)일 때는 zone 과 무관하게 펌프를 잠근다(공회전 방지).
+실기 배선 (Raspberry Pi 40-pin header):
+  - physical pin 22 = BCM GPIO25 -> LR7843 SIG
+  - physical pin 20 = GND        -> LR7843 GND
+
+현재 제어는 디지털 ON/OFF이며 HIGH = ON(100%), LOW = OFF이다.
+펌프는 전압이 인가되는 순간 바로 작동하므로 "고랑 밖에서는 절대 켜지지
+않도록" 소프트웨어 인터록을 강제한다.
+
+안전 기능
+  1) tick()이 매 제어 주기마다 MOSFET 출력 상태를 다시 확정한다.
+  2) PUMP_MAX_CONTINUOUS_SEC 최대 연속 가동 워치독을 유지한다.
+  3) 물 부족(water_low)일 때는 zone과 무관하게 펌프를 잠근다.
 """
 
 import time
 
-from config import (
-    GPIO_WARNINGS,
-    PUMP_MAX_CONTINUOUS_SEC,
-    PUMP_RELAY_ACTIVE_HIGH,
-    PUMP_RELAY_PIN,
-)
+from config import GPIO_WARNINGS, PUMP_MAX_CONTINUOUS_SEC
 from logutil import get_logger
 
 log = get_logger("pump")
+
+# RPi.GPIO uses BCM numbering. Physical pin 22 on the 40-pin header is BCM25.
+PUMP_MOSFET_PIN = 25
+PUMP_MOSFET_ACTIVE_HIGH = True
 
 try:
     import RPi.GPIO as GPIO
@@ -38,7 +42,7 @@ class PumpController:
         self._in_furrow = False        # 안전 게이트: 지금 고랑 안인가
         self._requested_on = False     # 상위 로직이 켜기를 원하는가
         self._locked_out = False       # 물 부족 등으로 잠금
-        self._relay_state = False
+        self._output_state = False
         self._on_since = None
         self._gpio_ready = False
 
@@ -46,20 +50,18 @@ class PumpController:
             try:
                 GPIO.setwarnings(GPIO_WARNINGS)
                 GPIO.setmode(GPIO.BCM)
-                # [수정/중요] initial 을 명시하지 않으면 setup 직후 핀이 LOW 가 된다.
-                # active-low 릴레이 모듈(PUMP_RELAY_ACTIVE_HIGH=False)에서는
-                # LOW = 펌프 ON 이므로, 프로그램이 뜨는 순간 물이 쏟아진다.
-                # 반드시 'OFF 에 해당하는 레벨'로 시작해야 한다.
-                off_level = GPIO.LOW if PUMP_RELAY_ACTIVE_HIGH else GPIO.HIGH
-                GPIO.setup(PUMP_RELAY_PIN, GPIO.OUT, initial=off_level)
+                # LR7843 is active-high. Explicit LOW initialization prevents
+                # a startup pulse from briefly turning the pump on.
+                off_level = GPIO.LOW if PUMP_MOSFET_ACTIVE_HIGH else GPIO.HIGH
+                GPIO.setup(PUMP_MOSFET_PIN, GPIO.OUT, initial=off_level)
                 self._gpio_ready = True
             except Exception as exc:
-                log.error("펌프 GPIO 초기화 실패: %s", exc)
-        self._apply_relay(False)
+                log.error("펌프 MOSFET GPIO 초기화 실패: %s", exc)
+        self._apply_output(False)
 
     # ------------------------------------------------------------------
-    def _apply_relay(self, on: bool):
-        self._relay_state = bool(on)
+    def _apply_output(self, on: bool):
+        self._output_state = bool(on)
         if on:
             if self._on_since is None:
                 self._on_since = time.monotonic()
@@ -68,8 +70,8 @@ class PumpController:
 
         if not self._gpio_ready:
             return
-        level = GPIO.HIGH if (on == PUMP_RELAY_ACTIVE_HIGH) else GPIO.LOW
-        GPIO.output(PUMP_RELAY_PIN, level)
+        level = GPIO.HIGH if (on == PUMP_MOSFET_ACTIVE_HIGH) else GPIO.LOW
+        GPIO.output(PUMP_MOSFET_PIN, level)
 
     def _desired_state(self) -> bool:
         return self._requested_on and self._in_furrow and not self._locked_out
@@ -84,20 +86,20 @@ class PumpController:
             self._requested_on = False
         if changed:
             log.debug("펌프 zone -> %s", "고랑 안" if in_furrow else "고랑 밖")
-        self._apply_relay(self._desired_state())
+        self._apply_output(self._desired_state())
 
     def set_lockout(self, locked: bool):
         """물 부족 등으로 펌프를 강제로 잠근다(공회전 방지)."""
         if self._locked_out != bool(locked):
             log.info("펌프 잠금 %s", "설정" if locked else "해제")
         self._locked_out = bool(locked)
-        self._apply_relay(self._desired_state())
+        self._apply_output(self._desired_state())
 
     def turn_on(self) -> bool:
-        """펌프 ON 요청. 반환값 = 실제로 켜졌는지 (고랑 밖/잠금이면 False)."""
+        """펌프 ON(100%) 요청. 실제로 켜졌으면 True를 반환한다."""
         self._requested_on = True
         desired = self._desired_state()
-        self._apply_relay(desired)
+        self._apply_output(desired)
         if not desired:
             log.debug("펌프 ON 요청이 인터록에 의해 차단되었습니다.")
         return desired
@@ -105,13 +107,10 @@ class PumpController:
     def turn_off(self):
         """OFF는 구역과 무관하게 항상 즉시 반영."""
         self._requested_on = False
-        self._apply_relay(False)
+        self._apply_output(False)
 
     def tick(self):
-        """
-        매 제어 주기마다 호출. 릴레이 상태를 다시 확정하고
-        최대 연속 가동 시간을 감시한다.
-        """
+        """MOSFET 출력을 재확정하고 최대 연속 가동 시간을 감시한다."""
         desired = self._desired_state()
 
         if (
@@ -125,20 +124,20 @@ class PumpController:
                 PUMP_MAX_CONTINUOUS_SEC,
             )
             self._requested_on = False
-            self._apply_relay(False)
+            self._apply_output(False)
             return
 
-        if desired != self._relay_state:
-            self._apply_relay(desired)
+        if desired != self._output_state:
+            self._apply_output(desired)
 
     def is_on(self) -> bool:
-        return self._relay_state
+        return self._output_state
 
     def cleanup(self):
         self.turn_off()
         if self._gpio_ready:
             try:
-                GPIO.cleanup(PUMP_RELAY_PIN)
+                GPIO.cleanup(PUMP_MOSFET_PIN)
             except Exception:
                 pass
             self._gpio_ready = False
