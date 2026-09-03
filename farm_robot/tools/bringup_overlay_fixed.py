@@ -2,37 +2,42 @@
 """
 farm_robot/tools/bringup_overlay_fixed.py
 ------------------------------------------
-bringup_monitor.py 의 **오버레이가 잘 나오는 case** 만 떼어내 고정값으로
-띄우는 도구. 센서/메가/웹캠이 전혀 없어도, 값이 흔들리지 않는 화면 하나를
-그대로 볼 수 있다.
+bringup_monitor.py 의 **오버레이가 잘 나오는 case** 를, **카메라만 실제
+장치로** 쓰고 나머지 수치는 전부 고정해서 띄우는 도구.
+
+    실제 : USB 웹캠 영상 + ArUco 마커 검출(ID / 거리 / 방위)
+    고정 : 좌/우 ToF, 물통 수위/상태, 펌프 상태/듀티, 메가 링크, fps
+
+ToF(adafruit_vl53l1x/blinka)나 메가가 아직 안 붙은 상태에서도 카메라 화면
+위에 오버레이가 어떻게 얹히는지 그대로 확인할 수 있다.
 
 bringup_monitor.py 와의 차이
     · compose() / MjpegServer / 저장 루틴은 **bringup_monitor 에서 그대로
       가져다 쓴다**(import). 따라서 여기서 보이는 레이아웃은 실기 모니터와
       100% 같은 코드가 그린 것이다.
-    · 값만 고정이다. MockLink 처럼 수위가 계속 내려가거나 ToF 가 사인파로
-      흔들리지 않는다 -> 스크린샷/보고서용으로 쓰기 좋다.
-    · 배경도 기본은 합성 고랑 장면 + 실제 렌더링된 ArUco 마커라서,
-      마커 검출 -> ID/거리/방위 표기까지 실제 코드 경로를 태운다.
+    · 카메라 외의 값이 고정이다. MockLink 처럼 수위가 계속 내려가거나
+      ToF 가 사인파로 흔들리지 않는다 -> 스크린샷/보고서용으로 쓰기 좋다.
+    · 카메라가 없으면 합성 고랑 장면 + 실제 렌더링된 ArUco 마커로 대체한다
+      (--no-camera 로 강제할 수도 있다).
 
-    # 창으로 띄우기 (기본 case = good)
+    # 실제 웹캠 + 고정 오버레이 (기본. config.CAMERA_INDEX 사용)
     python tools/bringup_overlay_fixed.py
 
-    # case 골라서
-    python tools/bringup_overlay_fixed.py --case low
+    # 웹캠 번호 지정 / case 골라서
+    python tools/bringup_overlay_fixed.py --camera 2 --case low
     python tools/bringup_overlay_fixed.py --list-cases
 
-    # 사진 1장만 저장하고 종료 (헤드리스 Pi/서버에서도 됨)
+    # 사진 1장만 저장하고 종료 (--warmup 초만큼 웹캠 예열)
     python tools/bringup_overlay_fixed.py --snapshot ../media/bringup/fixed_good.jpg
 
-    # 모든 case 를 한 장씩 저장
+    # 모든 case 를 한 장씩 저장 (같은 카메라 화면 위에)
     python tools/bringup_overlay_fixed.py --snapshot-all ../media/bringup
 
     # 브라우저로 확인 -> http://<이 장치 IP>:8080
     python tools/bringup_overlay_fixed.py --stream 8080
 
-    # 배경만 실제 웹캠 / 사진으로 바꾸고 수치는 고정
-    python tools/bringup_overlay_fixed.py --camera 0
+    # 카메라도 안 쓰기: 합성 장면 / 사진 배경
+    python tools/bringup_overlay_fixed.py --no-camera
     python tools/bringup_overlay_fixed.py --image ../media/field.jpg
 
 키 (창 모드)
@@ -40,6 +45,9 @@ bringup_monitor.py 와의 차이
     c         다음 case 로 순환 (오버레이 상태별로 눈으로 비교)
     s         현재 화면 저장 (media/bringup)
 """
+
+# 이 도구에서 '진짜'인 것은 카메라(+마커 검출)뿐이다. ToF/메가는 건드리지
+# 않으므로 adafruit_vl53l1x, RPi.GPIO, pyserial 이 없어도 그냥 돈다.
 
 import argparse
 from pathlib import Path
@@ -270,16 +278,28 @@ def annotate_markers(frame, dic, params, det, marker_cm):
 
 
 # ---------------------------------------------------------------- 한 장 만들기
-def render_case(name, args, dic, params, det, cap=None):
-    """case 이름 -> 오버레이가 얹힌 최종 프레임 1장."""
+def render_case(name, args, dic, params, det, cap=None, background=None):
+    """case 이름 -> 오버레이가 얹힌 최종 프레임 1장.
+
+    background 를 주면 그 프레임을 배경으로 쓴다(모든 case 를 **같은** 카메라
+    화면 위에 그려 비교할 때 사용). 원본은 건드리지 않는다.
+    """
     case = CASES[name]
     marker_id = (case["markers"][0] if case["markers"] else None)
 
-    if cap is not None:
+    if background is not None:
+        frame = (background.copy()
+                 if (background.shape[1] == args.width and
+                     background.shape[0] == args.height)
+                 else cv2.resize(background, (args.width, args.height)))
+    elif cap is not None:
         ok, frame = cap.read()
         if not ok or frame is None:
             frame = np.full((args.height, args.width, 3), 40, np.uint8)
-        else:
+            cv2.putText(frame, "NO FRAME", (args.width // 2 - 80,
+                                            args.height // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (120, 120, 120), 2)
+        elif frame.shape[1] != args.width or frame.shape[0] != args.height:
             frame = cv2.resize(frame, (args.width, args.height))
     elif args.image:
         frame = load_background(args.image, args.width, args.height)
@@ -287,11 +307,12 @@ def render_case(name, args, dic, params, det, cap=None):
         frame = furrow_scene(args.width, args.height, dic, marker_id,
                              args.marker_px)
 
-    # 배경이 합성 장면이면 마커를 실제로 검출해서 실기와 같은 표기를 얻는다.
-    # 웹캠/사진 배경에서는 검출이 될 수도, 안 될 수도 있으므로
-    # 검출 결과가 없으면 case 에 적힌 ID 를 그대로 표시한다.
+    # 마커는 항상 **실제로 검출**한다(실기와 같은 표기).
+    # 카메라를 쓸 때는 검출 결과를 그대로 믿는다 — 안 보이면 "없음" 이 맞고,
+    # 그게 카메라/마커 상태를 확인하는 목적이다.
+    # 합성/사진 배경에서 검출이 안 되면 case 에 적힌 ID 로 채워 준다.
     found = annotate_markers(frame, dic, params, det, args.marker_cm)
-    if not found:
+    if not found and cap is None:
         found = list(case["markers"])
 
     link = FixedLink(case, args.tank_mm)
@@ -299,25 +320,43 @@ def render_case(name, args, dic, params, det, cap=None):
                    args.empty_mm, args.tof_max, link.pump_duty, args.fps)
 
 
+def _config_defaults():
+    """config.py 값을 쓰되, 없으면(설정 import 실패) 안전한 기본값."""
+    try:
+        from config import CAMERA_INDEX, CAMERA_RESOLUTION, MARKER_SIZE_M
+
+        return (int(CAMERA_INDEX), int(CAMERA_RESOLUTION[0]),
+                int(CAMERA_RESOLUTION[1]), float(MARKER_SIZE_M) * 100.0)
+    except Exception as exc:
+        print(f"config 로드 실패({exc}) - 기본값 640x480 / 카메라 0 을 씁니다.")
+        return 0, 640, 480, 20.0
+
+
 def main():
+    cam_index, cam_w, cam_h, marker_cm = _config_defaults()
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--case", default=DEFAULT_CASE, choices=sorted(CASES),
                     help=f"띄울 고정 case (기본 {DEFAULT_CASE})")
     ap.add_argument("--list-cases", action="store_true", help="case 목록만 출력")
-    ap.add_argument("--width", type=int, default=640)
-    ap.add_argument("--height", type=int, default=480)
+    ap.add_argument("--width", type=int, default=cam_w)
+    ap.add_argument("--height", type=int, default=cam_h)
     ap.add_argument("--fps", type=float, default=30.0,
                     help="화면에 표시할 fps 숫자(고정)")
     ap.add_argument("--tank-mm", type=int, default=TANK_MM)
     ap.add_argument("--empty-mm", type=int, default=EMPTY_MM)
     ap.add_argument("--tof-max", type=float, default=TOF_MAX)
-    ap.add_argument("--marker-cm", type=float, default=20.0,
-                    help="마커 한 변(cm). config.MARKER_SIZE_M 과 맞추세요")
+    ap.add_argument("--marker-cm", type=float, default=marker_cm,
+                    help="마커 한 변(cm). 기본값은 config.MARKER_SIZE_M")
     ap.add_argument("--marker-px", type=int, default=90,
                     help="합성 배경의 마커 크기(px). 작을수록 먼 거리로 표기됨")
-    ap.add_argument("--image", help="배경으로 쓸 사진(수치는 그대로 고정)")
-    ap.add_argument("--camera", type=int, default=None,
-                    help="배경만 실제 웹캠에서 받기(수치는 고정)")
+    ap.add_argument("--image", help="배경으로 쓸 사진(카메라 대신)")
+    ap.add_argument("--camera", type=int, default=cam_index,
+                    help=f"실제 웹캠 인덱스 (기본 config.CAMERA_INDEX={cam_index})")
+    ap.add_argument("--no-camera", action="store_true",
+                    help="웹캠도 쓰지 않고 합성 고랑 장면으로 대체")
+    ap.add_argument("--warmup", type=float, default=1.0,
+                    help="웹캠 예열 시간(초). 첫 프레임이 검게 나오는 것 방지")
     ap.add_argument("--stream", type=int, default=0, help="MJPEG 포트(0=안 씀)")
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--snapshot", metavar="PATH",
@@ -335,20 +374,40 @@ def main():
 
     dic, params, det = build_detector()
 
+    # --- 카메라만 진짜 장치 ---
     cap = None
-    if args.camera is not None:
+    if not args.no_camera and not args.image:
         cap = cv2.VideoCapture(args.camera)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
         if not cap.isOpened():
-            print(f"경고: 웹캠 {args.camera} 를 열지 못했습니다 — 합성 배경을 씁니다.")
+            print(f"경고: 웹캠 {args.camera} 를 열지 못했습니다 - 합성 배경을 씁니다.")
             cap.release()
             cap = None
+        else:
+            # 웹캠은 자동노출/화이트밸런스가 잡히기 전 프레임이 검게 나온다.
+            deadline = time.monotonic() + max(0.0, args.warmup)
+            while time.monotonic() < deadline:
+                cap.read()
+            got = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                   int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+            print(f"웹캠 {args.camera} 열림 {got[0]}x{got[1]} - "
+                  f"ToF/수위/펌프는 case '{args.case}' 고정값입니다.")
 
     # --- case 전체 저장 ---
+    #     모든 case 가 같은 카메라 화면 위에 그려지도록 프레임 1장만 잡는다.
     if args.snapshot_all:
+        shot = None
+        if cap is not None:
+            ok, shot = cap.read()
+            if not ok:
+                shot = None
         for name in sorted(CASES):
-            out = render_case(name, args, dic, params, det, cap)
+            out = render_case(name, args, dic, params, det, cap, shot)
             saved = _save_frame(Path(args.snapshot_all) / f"fixed_{name}.jpg",
                                 out)
             print("저장:", saved)
