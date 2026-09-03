@@ -50,6 +50,7 @@ sim_gazebo/scripts/policy_harness.py
 import argparse
 import json
 import math
+import os
 import random
 import sys
 import time
@@ -158,6 +159,13 @@ class PolicyHarness:
             "fail": "",
         }
         self._ids_seen = set()
+
+        # --- 영상 녹화 ---
+        self._rec_dir = args.record
+        self._rec_n = 0
+        self._phase = "INIT"
+        if self._rec_dir:
+            os.makedirs(self._rec_dir, exist_ok=True)
 
     # ------------------------------------------------ 콜백
     def _on_image(self, msg):
@@ -285,6 +293,8 @@ class PolicyHarness:
         self._update_od()
         self.r["ticks"] += 1
         self._score_tick()
+        if self._rec_dir and self.r["ticks"] % 2 == 0:
+            self._record_frame(lin, ang)
         time.sleep(DT)
 
     def _score_tick(self):
@@ -298,6 +308,63 @@ class PolicyHarness:
             self.r["max_dev_cm"] = max(self.r["max_dev_cm"], dev * 100)
             if dev > MARGIN:
                 self.r["ridge_hit_ticks"] += 1
+
+    def _record_frame(self, lin, ang):
+        """카메라 프레임에 마커/ToF/상태를 얹어 저장한다(영상 소재)."""
+        if self.frame is None:
+            return
+        img = cv2.cvtColor(self.frame, cv2.COLOR_RGB2BGR).copy()
+        h, w = img.shape[:2]
+        gray = cv2.cvtColor(self.frame, cv2.COLOR_RGB2GRAY)
+        if self._det is not None:
+            corners, ids, _ = self._det.detectMarkers(gray)
+        else:
+            corners, ids, _ = cv2.aruco.detectMarkers(
+                gray, self._dict, parameters=self._params)
+        if ids is not None:
+            cv2.aruco.drawDetectedMarkers(img, corners, ids)
+            for c, i in zip(corners, ids.flatten()):
+                q = c.reshape(4, 2).astype(int)
+                cv2.putText(img, f"ID {int(i)}", (q[:, 0].min(), q[:, 1].min() - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 230, 255), 2,
+                            cv2.LINE_AA)
+
+        def bar(x0, label, val):
+            cv2.rectangle(img, (x0, h - 84), (x0 + 22, h - 14), (35, 35, 35), -1)
+            if 0 < val < TOF_MAX:
+                fill = int(70 * (1.0 - min(1.0, val / 0.4)))
+                col = (80, 80, 255) if val < 0.10 else (120, 255, 120)
+                cv2.rectangle(img, (x0, h - 14 - fill), (x0 + 22, h - 14), col, -1)
+                txt = f"{val*100:.0f}"
+            else:
+                txt = "--"
+            cv2.putText(img, label, (x0 - 2, h - 92), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45, (230, 230, 230), 1, cv2.LINE_AA)
+            cv2.putText(img, txt, (x0 - 2, h - 2), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45, (230, 230, 230), 1, cv2.LINE_AA)
+
+        bar(14, "ToF L", self.tof_l)
+        bar(w - 40, "ToF R", self.tof_r)
+
+        dev = ""
+        if self.truth is not None:
+            x, y, _ = self.truth
+            k = round(x / SPACING)
+            if 0.2 < y < FIELD_LEN - 0.2:
+                dev = f"  dev {abs(x - k*SPACING)*100:.1f}cm"
+        rows = [
+            f"PHASE  {self._phase}",
+            f"policy {self.a.search} + {self.a.entry}   vision {self.a.vision}",
+            f"cmd v={lin:+.2f} w={ang:+.2f}{dev}",
+        ]
+        for i, t in enumerate(rows):
+            yy = 24 + i * 22
+            cv2.putText(img, t, (12, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                        (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(img, t, (12, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                        (245, 245, 245), 1, cv2.LINE_AA)
+        cv2.imwrite(os.path.join(self._rec_dir, f"{self._rec_n:05d}.png"), img)
+        self._rec_n += 1
 
     def _dbg(self, msg):
         if self.a.debug:
@@ -322,6 +389,7 @@ class PolicyHarness:
     # ------------------------------------------------ 상태 1: 탐색
     def do_search(self, timeout=25.0):
         """정책별 탐색. 3프레임 이상 안정적으로 보이는 팻말을 고른다."""
+        self._phase = "SEARCH (sweep +-55deg)"
         t0 = time.time()
         hits = {}
         sweep_dir = 1.0
@@ -478,6 +546,7 @@ class PolicyHarness:
     # ------------------------------------------------ 상태 2: 진입
     def do_enter(self, timeout=150.0, adv_limit=1.6):
         """밭 방향으로 서서 전진. 좌우 벽이 연속으로 잡히면 진입 성공."""
+        self._phase = "ENTER FURROW"
         self.turn_to(self.field_th)
         t0 = time.time()
         good = 0
@@ -539,6 +608,7 @@ class PolicyHarness:
     # ------------------------------------------------ 상태 3: 고랑 주행
     def do_furrow(self, timeout=45.0, speed=0.22, kp=1.2, kd=0.45):
         """고랑 끝까지 주행. 좌우 벽이 연속으로 사라지면 끝으로 판정."""
+        self._phase = "FOLLOW FURROW (vision + ToF)"
         t0 = time.time()
         lost = 0
         prev = None
@@ -627,6 +697,7 @@ class PolicyHarness:
         self.r["drive_len_out"] = self.r["drive_len_m"]
 
         # 유턴: 밭 방위도 함께 뒤집는다(복귀 구간의 헤딩 유지 기준이 된다)
+        self._phase = "U-TURN"
         self.r["uturn_ok"] = self.turn_to(wrap(self.od[2] + math.pi), timeout=16)
         self.field_th = wrap(self.field_th + math.pi)
 
@@ -636,6 +707,7 @@ class PolicyHarness:
         #   먼저 고랑에 다시 들어간 뒤 추종을 시작한다.
         # 고랑 끝 판정 후 3초를 더 달렸으므로 1m 남짓 지나쳐 있다.
         # 재진입 예산을 넉넉히 준다.
+        self._phase = "RE-ENTER"
         reacq = self.do_enter(timeout=60.0, adv_limit=2.8)
         self.r["reacquired"] = bool(reacq)
         self.r["returned_ok"] = bool(reacq and self.do_furrow(timeout=60.0))
@@ -665,6 +737,8 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max-dist", type=float, default=3.0,
                     help="이 거리보다 먼 팻말은 무시(엉뚱한 고랑 진입 방지)")
+    ap.add_argument("--record", default=None,
+                    help="프레임을 저장할 디렉터리(영상 소재)")
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
 

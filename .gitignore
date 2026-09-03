@@ -7,3 +7,7 @@ runs/
 *.pth
 .venv-train
 sim_gazebo/
+media/_seq/
+media/frames_vision/
+media/frames_train/
+
