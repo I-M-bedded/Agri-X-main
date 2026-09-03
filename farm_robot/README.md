@@ -441,6 +441,26 @@ python3 tools/bringup_monitor.py --headless --stream 8080
 Mega `TRIG/ECHO=D30/D31`, `PWM=D9`가 표시됩니다. Mega에는
 `agrix_tank_pump.ino`가 올라가 있어야 수위·펌프 값이 실값으로 보입니다.
 
+**오버레이가 잘 나온 상태만 고정값으로 띄우기** — ToF·Mega·웹캠이
+하나도 없어도, 값이 흔들리지 않는 화면을 그대로 볼 수 있습니다.
+`bringup_monitor.py` 의 `compose()` 를 그대로 import 하므로 레이아웃은
+실기 모니터와 같은 코드가 그립니다.
+
+```bash
+# 정상 case 를 창으로 (c 키로 case 순환, s 키로 저장)
+python3 tools/bringup_overlay_fixed.py
+
+# case 목록: good / full / low / empty / furrow_end / megadown
+python3 tools/bringup_overlay_fixed.py --list-cases
+python3 tools/bringup_overlay_fixed.py --case low
+
+# 전체 case 를 한 장씩 저장 (헤드리스에서도 됨)
+python3 tools/bringup_overlay_fixed.py --snapshot-all ../media/bringup_fixed
+
+# 배경만 실제 웹캠에서 받고 수치는 고정
+python3 tools/bringup_overlay_fixed.py --camera 0
+```
+
 ### 8-3. 현장에서 반드시 맞춰야 하는 값 ★
 
 기본값 그대로 두면 **로봇은 반드시 실패합니다.** 아래 순서대로 채우세요.
