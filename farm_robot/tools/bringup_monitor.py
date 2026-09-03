@@ -581,7 +581,6 @@ def main():
             from sensors.tof_sensor import ToFPair
 
             tof_pair = ToFPair(TOF_LEFT, TOF_RIGHT)
-            tof_pair.init_hardware()
         except Exception as exc:
             print(f"ToF 초기화 실패: {exc} — ToF 없이 계속합니다.")
             tof_pair = None

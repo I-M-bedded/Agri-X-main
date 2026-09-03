@@ -27,6 +27,7 @@
 //      PUMP OFF          펌프 정지
 //      STOP              펌프 정지 (PUMP OFF 와 동일)
 //      STATUS            텔레메트리 1줄 즉시 전송
+//      DIAG              초음파 원시 ECHO 시간/실패 원인 즉시 전송
 //      PING              -> PONG
 //      CAL <높이mm> <empty mm> <오프셋mm>   물통 형상 런타임 보정
 //
@@ -101,6 +102,11 @@ bool emptyLatched = false;
 bool sensorFault = true;         // 첫 유효 측정 전까지 이상으로 본다
 uint8_t faultStreak = 0;
 
+enum class PingResult : uint8_t { NOT_RUN, OK, TIMEOUT, OUT_OF_RANGE };
+PingResult lastPingResult = PingResult::NOT_RUN;
+uint32_t lastEchoUs = 0;
+int16_t lastRawMm = -1;
+
 uint8_t pumpTarget = 0;          // 상위가 요청한 듀티
 uint8_t pumpDuty = 0;            // 실제 출력 듀티(램프 적용)
 bool pumpLocked = false;
@@ -127,12 +133,22 @@ int16_t pingOnce() {
   digitalWrite(US_TRIG_PIN, LOW);
 
   const uint32_t us = pulseIn(US_ECHO_PIN, HIGH, ECHO_TIMEOUT_US);
-  if (us == 0) return -1;                       // 타임아웃 = 반사 없음
+  lastEchoUs = us;
+  if (us == 0) {
+    lastRawMm = -1;
+    lastPingResult = PingResult::TIMEOUT;
+    return -1;                                  // 타임아웃 = 반사 없음
+  }
 
   // 음속 343 m/s (20도 기준) -> 왕복이므로 절반.
   //   0.343 mm/us / 2 = 0.1715
   const int32_t mm = (int32_t)(us * 0.1715f);
-  if (mm < 20 || mm > 4000) return -1;          // 사각지대 / 사거리 밖
+  lastRawMm = (int16_t)mm;
+  if (mm < 20 || mm > 4000) {
+    lastPingResult = PingResult::OUT_OF_RANGE;
+    return -1;                                  // 사각지대 / 사거리 밖
+  }
+  lastPingResult = PingResult::OK;
   return (int16_t)mm;
 }
 
@@ -266,6 +282,38 @@ void sendTelemetry() {
   Serial.println(flags);
 }
 
+const __FlashStringHelper *pingResultName() {
+  switch (lastPingResult) {
+    case PingResult::OK:           return F("OK");
+    case PingResult::TIMEOUT:      return F("TIMEOUT");
+    case PingResult::OUT_OF_RANGE: return F("OUT_OF_RANGE");
+    default:                       return F("NOT_RUN");
+  }
+}
+
+void sendDiagnostics() {
+  Serial.print(F("DIAG trig="));
+  Serial.print(US_TRIG_PIN);
+  Serial.print(F(" echo="));
+  Serial.print(US_ECHO_PIN);
+  Serial.print(F(" pwm="));
+  Serial.print(PUMP_PWM_PIN);
+  Serial.print(F(" result="));
+  Serial.print(pingResultName());
+  Serial.print(F(" echo_us="));
+  Serial.print(lastEchoUs);
+  Serial.print(F(" raw_mm="));
+  Serial.print(lastRawMm);
+  Serial.print(F(" median_mm="));
+  Serial.print(distMm);
+  Serial.print(F(" echo_idle="));
+  Serial.print(digitalRead(US_ECHO_PIN));
+  Serial.print(F(" fault_streak="));
+  Serial.print(faultStreak);
+  Serial.print(F(" samples="));
+  Serial.println(sampleCount);
+}
+
 void handleLine(char *line) {
   while (*line == ' ') line++;
   if (*line == '\0') return;
@@ -279,6 +327,10 @@ void handleLine(char *line) {
   }
   if (strcmp(cmd, "STATUS") == 0) {
     sendTelemetry();
+    return;
+  }
+  if (strcmp(cmd, "DIAG") == 0) {
+    sendDiagnostics();
     return;
   }
   if (strcmp(cmd, "STOP") == 0) {
@@ -355,7 +407,7 @@ void setup() {
   Serial.begin(115200);
   while (!Serial) { ; }
   Serial.println(F("READY AGRIX_TANK_PUMP_V1"));
-  Serial.println(F("PUMP <0-255|OFF> | STOP | STATUS | PING | CAL h empty offset"));
+  Serial.println(F("PUMP <0-255|OFF> | STOP | STATUS | DIAG | PING | CAL h empty offset"));
 
   lastCommandMs = millis();
 }

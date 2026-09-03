@@ -286,6 +286,11 @@ class ToFPair:
 
     # ------------------------------------------------------------------
     def init_hardware(self):
+        # The constructor initializes once. Re-running XSHUT would reset the
+        # live sensors back to 0x29 and invalidate their driver objects.
+        if self._initialized:
+            return
+
         # PC 개발환경(GPIO 없음) 또는 명시적 sim 백엔드
         if self.backend == "sim" or not _HAS_GPIO:
             if self.backend != "sim":
@@ -301,6 +306,20 @@ class ToFPair:
             return
         except Exception as exc:
             log.error("ToF 초기화 실패: %s", exc)
+            # Do not leave one sensor/driver half-initialized after failure.
+            for sensor in (self.left, self.right):
+                sensor.close()
+            if self._i2c is not None:
+                try:
+                    self._i2c.deinit()
+                except Exception:
+                    pass
+                self._i2c = None
+            for pin in (self.left.xshut_pin, self.right.xshut_pin):
+                try:
+                    GPIO.output(pin, GPIO.LOW)
+                except Exception:
+                    pass
 
         # [수정/중요] 실기에서 초기화에 실패했을 때 가짜 값을 만들지 않는다.
         # 가짜 값(=항상 고랑 한가운데)은 로봇이 고랑 끝을 감지하지 못한 채
