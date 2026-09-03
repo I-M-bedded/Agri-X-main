@@ -83,11 +83,13 @@ PUMP_MAX_CONTINUOUS_SEC = 120.0
 #        이 시퀀스는 sensors/tof_sensor.py 의 ToFPair 가 담당한다.
 # =========================================================
 TOF_LEFT = {
-    "xshut_pin": 17,
+    # Pi physical pin 29 = BCM GPIO5
+    "xshut_pin": 5,
     "i2c_address": 0x30,
 }
 TOF_RIGHT = {
-    "xshut_pin": 27,
+    # Pi physical pin 31 = BCM GPIO6
+    "xshut_pin": 6,
     "i2c_address": 0x31,
 }
 TOF_DEFAULT_I2C_ADDRESS = 0x29  # VL53L1X 공장 출하 기본 주소
@@ -201,6 +203,10 @@ CAMERA_WARMUP_SEC = 1.0
 #     예전 코드는 COLOR_RGB2HSV 를 써서 흙(주황~갈색, H≈10)이 파랑(H≈110)으로
 #     뒤집혀 SOIL_HSV 범위에 절대 안 들어갔고, 비전 신뢰도가 항상 0이었다.
 CAMERA_OUTPUT_IS_BGR = True
+
+# tools/webcam_checkerboard_calibration.py의 기본 출력.
+# 파일이 있으면 ArUcoDetector가 해상도를 확인한 뒤 자동으로 읽는다.
+CAMERA_CALIBRATION_FILE = "calibration/webcam_0.json"
 
 # [수정/버그] 예전 값은 DICT_4X4_50 이었는데, 이 딕셔너리는 ID 0~49 만 존재한다.
 #   그런데 FIELD_END_MARKER_ID 가 998 로 잡혀 있어서 **인쇄 자체가 불가능**했다.

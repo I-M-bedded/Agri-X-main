@@ -16,8 +16,8 @@
 |---|---|---|---|---|---|
 | Mega 제어 링크 | `SERIAL_MEGA_PORT` | — | USB | 양방향 | `/dev/ttyACM0`, 115200 |
 | 펌프 스위치 | `PUMP_RELAY_PIN` | **26** | 37 | OUT | HIGH = ON (아래 §5) |
-| 좌 ToF XSHUT | `TOF_LEFT["xshut_pin"]` | **17** | 11 | OUT | |
-| 우 ToF XSHUT | `TOF_RIGHT["xshut_pin"]` | **27** | 13 | OUT | |
+| 좌 ToF XSHUT | `TOF_LEFT["xshut_pin"]` | **5** | 29 | OUT | |
+| 우 ToF XSHUT | `TOF_RIGHT["xshut_pin"]` | **6** | 31 | OUT | |
 | I2C SDA | (고정) | **2** | 3 | — | ToF 2개 공통 |
 | I2C SCL | (고정) | **3** | 5 | — | ToF 2개 공통 |
 | 수위 센서 | `WATER_LEVEL_SENSOR_PIN` | **22** | 15 | IN | 내부 풀다운 |
@@ -110,15 +110,15 @@
 | GND | GND | GND |
 | SDA | GPIO2 (pin 3) | GPIO2 (pin 3) |
 | SCL | GPIO3 (pin 5) | GPIO3 (pin 5) |
-| **XSHUT** | **GPIO17 (pin 11)** | **GPIO27 (pin 13)** |
+| **XSHUT** | **GPIO5 (pin 29)** | **GPIO6 (pin 31)** |
 
 ```
 Pi GPIO2 ──┬── SDA (좌)
            └── SDA (우)
 Pi GPIO3 ──┬── SCL (좌)
            └── SCL (우)
-Pi GPIO17 ──── XSHUT (좌)     ← 따로!
-Pi GPIO27 ──── XSHUT (우)     ← 따로!
+Pi GPIO5  ──── XSHUT (좌)     ← 물리핀 29, 따로!
+Pi GPIO6  ──── XSHUT (우)     ← 물리핀 31, 따로!
 ```
 
 **왜 XSHUT 를 따로 빼나** — VL53L1X 는 공장 출하 주소가 둘 다 `0x29` 입니다.

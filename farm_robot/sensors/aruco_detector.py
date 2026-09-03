@@ -21,12 +21,15 @@ sensors/aruco_detector.py
   5) cv2 가 없어도 import 는 성공하고 빈 결과를 반환한다(PC 구조 점검용).
 """
 
+import json
 import math
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 from config import (
     ARUCO_DICTIONARY,
+    CAMERA_CALIBRATION_FILE,
     CAMERA_MATRIX,
     CAMERA_RESOLUTION,
     DIST_COEFFS,
@@ -47,6 +50,37 @@ try:
     _HAS_CV2 = True
 except ImportError:
     _HAS_CV2 = False
+
+
+def _load_camera_calibration(filename, target_resolution):
+    """보정 JSON을 읽고 실행 해상도에 맞게 내부 행렬을 조정한다."""
+    path = Path(filename).expanduser()
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parents[1] / path
+    if not path.is_file():
+        return None
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    matrix = np.asarray(data["camera_matrix"], dtype=np.float64)
+    distortion = np.asarray(data["dist_coeffs"], dtype=np.float64).reshape(-1, 1)
+    if matrix.shape != (3, 3) or distortion.size < 4:
+        raise ValueError("카메라 행렬/왜곡계수 형식이 잘못되었습니다.")
+
+    source = (int(data["image_width"]), int(data["image_height"]))
+    target = tuple(int(value) for value in target_resolution)
+    if source != target:
+        source_aspect = source[0] / source[1]
+        target_aspect = target[0] / target[1]
+        if abs(source_aspect - target_aspect) / source_aspect > 0.01:
+            raise ValueError(
+                f"보정 해상도 {source}와 실행 해상도 {target}의 화면비가 다릅니다.")
+        scale_x = target[0] / source[0]
+        scale_y = target[1] / source[1]
+        matrix[0, 0] *= scale_x
+        matrix[0, 2] *= scale_x
+        matrix[1, 1] *= scale_y
+        matrix[1, 2] *= scale_y
+    return matrix, distortion, path
 
 
 @dataclass
@@ -106,8 +140,23 @@ class ArucoDetector:
             self._aruco_dict = cv2.aruco.Dictionary_get(dict_id)
             self._params = cv2.aruco.DetectorParameters_create()
 
-        self._camera_matrix = CAMERA_MATRIX
-        self._dist_coeffs = DIST_COEFFS
+        self._camera_matrix = (
+            None if CAMERA_MATRIX is None
+            else np.asarray(CAMERA_MATRIX, dtype=np.float64)
+        )
+        self._dist_coeffs = (
+            None if DIST_COEFFS is None
+            else np.asarray(DIST_COEFFS, dtype=np.float64).reshape(-1, 1)
+        )
+        if self._camera_matrix is None and CAMERA_CALIBRATION_FILE:
+            try:
+                loaded = _load_camera_calibration(
+                    CAMERA_CALIBRATION_FILE, CAMERA_RESOLUTION)
+                if loaded is not None:
+                    self._camera_matrix, self._dist_coeffs, path = loaded
+                    log.info("카메라 보정값 로드: %s", path)
+            except Exception as exc:
+                log.error("카메라 보정 파일을 읽지 못했습니다: %s", exc)
         if self._camera_matrix is None:
             w, h = CAMERA_RESOLUTION
             focal = float(w)  # 매우 거친 근사 - 반드시 캘리브레이션으로 교체할 것
@@ -117,7 +166,7 @@ class ArucoDetector:
             self._dist_coeffs = np.zeros((5, 1), dtype=np.float64)
             log.warning(
                 "CAMERA_MATRIX 가 None 입니다. 근사값을 사용하므로 거리/각도 추정이 "
-                "부정확합니다. cv2.calibrateCamera 로 캘리브레이션 후 config 에 넣으세요."
+                "부정확합니다. tools/webcam_checkerboard_calibration.py 를 실행하세요."
             )
 
         # 마커 한 변 길이 기준 3D 코너 좌표 (마커 중심이 원점, 반시계 순서)

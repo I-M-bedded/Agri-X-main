@@ -22,6 +22,9 @@ farm_robot/tools/bringup_monitor.py
     # 헤드리스 -> 브라우저에서 http://<pi>:8080 으로 보기
     python tools/bringup_monitor.py --stream 8080
 
+    # 웹캠을 3초 예열한 후 오버레이 사진 1장 저장하고 종료
+    python tools/bringup_monitor.py --headless --snapshot ../media/bringup/demo.jpg
+
     # 하드웨어 없이 화면만 확인
     python tools/bringup_monitor.py --mock
 
@@ -30,10 +33,14 @@ farm_robot/tools/bringup_monitor.py
     space     펌프 on/off 토글
     + / -     펌프 듀티 ±16
     0         펌프 즉시 정지
-    s         현재 화면 저장
+    s         현재 오버레이 화면 저장 (media/bringup)
+
+브라우저 모드에서는 화면 아래의 "현재 오버레이 사진" 버튼으로
+현재 프레임을 JPEG로 다운로드할 수 있습니다.
 """
 
 import argparse
+from datetime import datetime
 import math
 from pathlib import Path
 import queue
@@ -45,6 +52,8 @@ import cv2
 import numpy as np
 
 _HERE = Path(__file__).resolve().parent
+_REPO_ROOT = _HERE.parents[1]
+_DEFAULT_SNAPSHOT_DIR = _REPO_ROOT / "media" / "bringup"
 sys.path.insert(0, str(_HERE.parent))
 
 # ---------------------------------------------------------------- 한글 텍스트
@@ -238,7 +247,7 @@ class MockLink:
         pass
 
     def link_ok(self):
-        return True
+        return bool(self.available)
 
     def close(self):
         pass
@@ -257,6 +266,27 @@ COL_FG = (245, 245, 245)
 def state_color(state):
     return {"OK": COL_OK, "FULL": COL_OK, "LOW": COL_WARN,
             "EMPTY": COL_BAD, "FAULT": COL_BAD}.get(state, COL_DIM)
+
+
+def _save_frame(path, bgr):
+    """Unicode 경로에서도 안전하게 현재 프레임을 저장한다."""
+    path = Path(path).expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    suffix = path.suffix.lower() or ".jpg"
+    if not path.suffix:
+        path = path.with_suffix(suffix)
+    params = ([cv2.IMWRITE_PNG_COMPRESSION, 3] if suffix == ".png" else
+              [cv2.IMWRITE_JPEG_QUALITY, 94])
+    ok, encoded = cv2.imencode(suffix, bgr, params)
+    if not ok:
+        raise RuntimeError(f"이미지 인코딩 실패: {path}")
+    path.write_bytes(encoded.tobytes())
+    return path
+
+
+def _timestamped_snapshot(directory):
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    return Path(directory) / f"agrix_bringup_{stamp}.jpg"
 
 
 def shade(img, x0, y0, x1, y1, alpha=0.45):
@@ -339,10 +369,15 @@ def compose(frame, link, tof, markers, tank_mm, empty_mm, tof_max, pump_target,
          f"({duty*100//255}%)", pcol[::-1]),
     ]
     line_h = int(23 * s)
-    shade(img, 0, 0, int(330 * s), int(14 * s) + line_h * len(rows))
+    pin_text = ("PIN  Pi(P): X 29/31, I2C 3/5  |  "
+                "Mega(D): US 30/31, PWM 9")
+    block_h = int(18 * s) + line_h * len(rows) + int(18 * s)
+    shade(img, 0, 0, min(w, int(480 * s)), block_h)
     for i, (text, color) in enumerate(rows):
         txt.add((int(10 * s), int(6 * s) + i * line_h), text, int(17 * s),
                 color)
+    txt.add((int(10 * s), int(8 * s) + len(rows) * line_h), pin_text,
+            max(11, int(13 * s)), COL_DIM)
 
     # ---- 우상단: 링크 / fps ----
     ok = link.link_ok()
@@ -389,7 +424,7 @@ def compose(frame, link, tof, markers, tank_mm, empty_mm, tof_max, pump_target,
 
 # ---------------------------------------------------------------- MJPEG 스트림
 class MjpegServer:
-    """헤드리스 파이에서 브라우저로 보기 위한 최소 MJPEG 서버."""
+    """헤드리스 Pi용 MJPEG 화면 + 현재 프레임 다운로드."""
 
     def __init__(self, port):
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -403,6 +438,49 @@ class MjpegServer:
                 pass
 
             def do_GET(self):
+                route = self.path.split("?", 1)[0]
+                if route in ("/", "/index.html"):
+                    page = """<!doctype html>
+<html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agri-X Bring-up</title>
+<style>body{margin:0;background:#111;color:#eee;font-family:sans-serif;text-align:center}
+h2{margin:14px}.wrap{max-width:960px;margin:auto}img{width:100%;height:auto}
+a{display:inline-block;margin:14px;padding:11px 18px;background:#287a3d;color:white;
+text-decoration:none;border-radius:6px}</style></head>
+<body><div class="wrap"><h2>Agri-X Bring-up Monitor</h2>
+<img src="/stream.mjpg" alt="camera stream">
+<a href="/snapshot.jpg" download="agrix_overlay.jpg">현재 오버레이 사진 저장</a>
+</div></body></html>""".encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(page)))
+                    self.end_headers()
+                    self.wfile.write(page)
+                    return
+
+                if route == "/snapshot.jpg":
+                    with outer._lock:
+                        buf = outer._frame
+                    if buf is None:
+                        self.send_error(503, "Frame not ready")
+                        return
+                    name = datetime.now().strftime(
+                        "agrix_overlay_%Y%m%d_%H%M%S.jpg")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header(
+                        "Content-Disposition", f'attachment; filename="{name}"')
+                    self.send_header("Content-Length", str(len(buf)))
+                    self.end_headers()
+                    self.wfile.write(buf)
+                    return
+
+                if route != "/stream.mjpg":
+                    self.send_error(404)
+                    return
+
                 self.send_response(200)
                 self.send_header(
                     "Content-Type",
@@ -452,13 +530,15 @@ def build_detector(params_only=False):
 
 
 def main():
+    from config import CAMERA_INDEX, CAMERA_RESOLUTION, MARKER_SIZE_M
+
     ap = argparse.ArgumentParser()
-    ap.add_argument("--camera-index", type=int, default=0)
-    ap.add_argument("--width", type=int, default=640)
-    ap.add_argument("--height", type=int, default=480)
+    ap.add_argument("--camera-index", type=int, default=CAMERA_INDEX)
+    ap.add_argument("--width", type=int, default=CAMERA_RESOLUTION[0])
+    ap.add_argument("--height", type=int, default=CAMERA_RESOLUTION[1])
     ap.add_argument("--serial", default="/dev/ttyACM0",
                     help="메가 포트. 가능하면 /dev/serial/by-id/... 를 쓰세요")
-    ap.add_argument("--marker-cm", type=float, default=18.0)
+    ap.add_argument("--marker-cm", type=float, default=MARKER_SIZE_M * 100.0)
     ap.add_argument("--tank-mm", type=int, default=300, help="물통 높이(mm)")
     ap.add_argument("--empty-mm", type=int, default=50, help="빈통 판정 수심(mm)")
     ap.add_argument("--tof-max", type=float, default=800.0)
@@ -469,6 +549,12 @@ def main():
     ap.add_argument("--stream", type=int, default=0,
                     help="MJPEG 포트(0=사용 안 함)")
     ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--snapshot", metavar="PATH",
+                    help="예열 후 오버레이 사진 1장을 저장하고 종료")
+    ap.add_argument("--snapshot-delay", type=float, default=3.0,
+                    help="--snapshot 전 웹캠 예열 시간(초, 기본 3)")
+    ap.add_argument("--snapshot-dir", default=str(_DEFAULT_SNAPSHOT_DIR),
+                    help="창에서 s 키로 저장할 폴더")
     args = ap.parse_args()
 
     # --- 카메라 ---
@@ -514,14 +600,21 @@ def main():
             link.available = False
 
     dic, params, det = build_detector()
+    calibration = None
+    calibration_attempted_sizes = set()
     stream = MjpegServer(args.stream) if args.stream else None
     if stream:
         print(f"MJPEG: http://<이 장치 IP>:{args.stream}/")
+        print("브라우저의 '현재 오버레이 사진 저장' 버튼으로 촬영합니다.")
+
+    print("핀맵: Pi 물리 XSHUT=29/31, SDA/SCL=3/5 | "
+          "Mega TRIG/ECHO=D30/D31, PWM=D9")
 
     pump_target = 0
     t_prev = time.monotonic()
     fps = 0.0
-    shot = 0
+    snapshot_at = (time.monotonic() + max(0.0, args.snapshot_delay)
+                   if args.snapshot else None)
 
     try:
         while True:
@@ -536,9 +629,28 @@ def main():
                                                  args.height // 2),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.9, (120, 120, 120), 2)
 
+            # 웹캠이 실제로 내는 해상도에 맞춰 보정값을 한 번만 읽는다.
+            frame_size = (frame.shape[1], frame.shape[0])
+            if not args.mock and frame_size not in calibration_attempted_sizes:
+                calibration_attempted_sizes.add(frame_size)
+                try:
+                    from config import CAMERA_CALIBRATION_FILE
+                    from sensors.aruco_detector import _load_camera_calibration
+
+                    loaded = _load_camera_calibration(
+                        CAMERA_CALIBRATION_FILE, frame_size)
+                    if loaded is not None:
+                        calibration = loaded[:2]
+                        print("카메라 보정값 로드:", loaded[2])
+                except Exception as exc:
+                    print(f"카메라 보정값 로드 실패: {exc} — 화각 근사값 사용")
+
             # 마커
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            if det is not None:
+            if args.mock:
+                # "NO CAMERA" 글자를 ArUco로 오판하지 않게 목업에서는 검출 생략.
+                corners, ids = [], None
+            elif det is not None:
                 corners, ids, _ = det.detectMarkers(gray)
             else:
                 corners, ids, _ = cv2.aruco.detectMarkers(
@@ -546,18 +658,43 @@ def main():
             found = []
             if ids is not None:
                 cv2.aruco.drawDetectedMarkers(frame, corners, ids)
-                fx = (frame.shape[1] / 2.0) / math.tan(math.radians(62.0) / 2)
+                if calibration is not None:
+                    camera_matrix, dist_coeffs = calibration
+                    fx = float(camera_matrix[0, 0])
+                else:
+                    fx = ((frame.shape[1] / 2.0) /
+                          math.tan(math.radians(62.0) / 2))
                 for c, i in zip(corners, ids.flatten()):
                     q = c.reshape(4, 2)
                     found.append(int(i))
+                    calibrated_pose = False
+                    if calibration is not None:
+                        half = args.marker_cm / 200.0
+                        object_points = np.asarray(
+                            [[-half, half, 0.0], [half, half, 0.0],
+                             [half, -half, 0.0], [-half, -half, 0.0]],
+                            dtype=np.float64)
+                        ok_pose, _rvec, tvec = cv2.solvePnP(
+                            object_points, q.astype(np.float64),
+                            camera_matrix, dist_coeffs,
+                            flags=cv2.SOLVEPNP_IPPE_SQUARE)
+                        if ok_pose:
+                            xyz = tvec.reshape(3)
+                            dist = float(np.linalg.norm(xyz))
+                            bear = math.degrees(math.atan2(-xyz[0], xyz[2]))
+                            calibrated_pose = True
                     # 세로변으로 거리 근사 (팻말이 기울어도 덜 흔들린다).
                     #   ★ 카메라 캘리브레이션 전까지는 어림값입니다.
-                    vpx = (np.linalg.norm(q[0] - q[3]) +
-                           np.linalg.norm(q[1] - q[2])) / 2.0
-                    dist = fx * (args.marker_cm / 100.0) / max(1.0, vpx)
-                    u = float(q[:, 0].mean())
-                    bear = math.degrees(math.atan2(frame.shape[1] / 2 - u, fx))
-                    cv2.putText(frame, f"ID{int(i)} {dist:.2f}m {bear:+.0f}deg",
+                    if not calibrated_pose:
+                        vpx = (np.linalg.norm(q[0] - q[3]) +
+                               np.linalg.norm(q[1] - q[2])) / 2.0
+                        dist = fx * (args.marker_cm / 100.0) / max(1.0, vpx)
+                        u = float(q[:, 0].mean())
+                        bear = math.degrees(
+                            math.atan2(frame.shape[1] / 2 - u, fx))
+                    mode = "CAL" if calibrated_pose else "EST"
+                    cv2.putText(frame,
+                                f"ID{int(i)} {dist:.2f}m {bear:+.0f}deg {mode}",
                                 (int(q[:, 0].min()), int(q[:, 1].min()) - 8),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 230, 255),
                                 2, cv2.LINE_AA)
@@ -583,6 +720,12 @@ def main():
 
             if stream:
                 stream.publish(out)
+
+            if snapshot_at is not None and now >= snapshot_at:
+                saved = _save_frame(args.snapshot, out)
+                print("오버레이 사진 저장:", saved)
+                break
+
             if not args.headless:
                 cv2.imshow("Agri-X bring-up", out)
                 k = cv2.waitKey(1) & 0xFF
@@ -601,10 +744,9 @@ def main():
                     pump_target = 0
                     link.send("STOP")
                 elif k == ord("s"):
-                    name = f"bringup_{shot:03d}.png"
-                    cv2.imwrite(name, out)
-                    print("저장:", name)
-                    shot += 1
+                    saved = _save_frame(
+                        _timestamped_snapshot(args.snapshot_dir), out)
+                    print("오버레이 사진 저장:", saved)
             else:
                 time.sleep(0.03)
 
@@ -622,7 +764,12 @@ def main():
                 tof_pair.close()
             except Exception:
                 pass
-        cv2.destroyAllWindows()
+        # opencv-python-headless 빌드에는 HighGUI 함수가 없다.
+        if not args.headless:
+            try:
+                cv2.destroyAllWindows()
+            except cv2.error:
+                pass
 
 
 if __name__ == "__main__":

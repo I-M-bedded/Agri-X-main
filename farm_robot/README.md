@@ -368,8 +368,8 @@ python3 -c "import cv2, numpy, RPi.GPIO, adafruit_vl53l1x, picamera2; print('전
 | 좌 BTS7960 RPWM / LPWM | Mega 펌웨어 | D6 / D7 |
 | 우 BTS7960 RPWM / LPWM | Mega 펌웨어 | D44 / D45 |
 | 펌프 릴레이 | `PUMP_RELAY_PIN` | 26 |
-| 좌 ToF XSHUT | `TOF_LEFT` | 17 |
-| 우 ToF XSHUT | `TOF_RIGHT` | 27 |
+| 좌 ToF XSHUT | `TOF_LEFT` | 5 (물리핀 29) |
+| 우 ToF XSHUT | `TOF_RIGHT` | 6 (물리핀 31) |
 | 수위 센서 | `WATER_LEVEL_SENSOR_PIN` | 22 |
 | 좌 엔코더 A / B | Mega 펌웨어 | D2 / D3 |
 | 우 엔코더 A / B | Mega 펌웨어 | D18 / D19 |
@@ -423,6 +423,24 @@ ToF가 안 잡히면 `i2cdetect -y 1` 을 보세요.
 붙여넣을 형태로 출력됩니다.
 사진 파일로 하려면: `python3 tools/setup.py 3 photo.jpg`
 
+**웹캠 + ToF + Mega 물통/펌프 오버레이 촬영**
+
+```bash
+# 창에서 실시간 확인: s 키로 media/bringup에 저장
+python3 tools/bringup_monitor.py
+
+# 3초 예열 후 사진 1장 저장하고 자동 종료
+python3 tools/bringup_monitor.py --headless \
+  --snapshot ../media/bringup/agrix_demo.jpg
+
+# 헤드리스: http://<Pi IP>:8080 에서 실시간 확인/사진 다운로드
+python3 tools/bringup_monitor.py --headless --stream 8080
+```
+
+상단 오버레이에 Pi 물리핀 `XSHUT=29/31`, `I2C=3/5`와
+Mega `TRIG/ECHO=D30/D31`, `PWM=D9`가 표시됩니다. Mega에는
+`agrix_tank_pump.ino`가 올라가 있어야 수위·펌프 값이 실값으로 보입니다.
+
 ### 8-3. 현장에서 반드시 맞춰야 하는 값 ★
 
 기본값 그대로 두면 **로봇은 반드시 실패합니다.** 아래 순서대로 채우세요.
@@ -475,9 +493,21 @@ ToF가 안 잡히면 `i2cdetect -y 1` 을 보세요.
 **건너뛰면 마커 거리 추정이 부정확해 입구 정렬이 계속 실패합니다.**
 
 ### 8-4. 카메라 캘리브레이션 — 건너뛰면 정렬이 계속 실패합니다
-체스보드를 여러 각도로 20장쯤 찍어 `cv2.calibrateCamera` 를 돌리고,
-결과를 `config.CAMERA_MATRIX`, `DIST_COEFFS` 에 넣으세요.
-지금은 "초점거리 ≈ 이미지 폭" 이라는 거친 근사값을 쓰고 경고를 띄웁니다.
+기본 설정은 **내부 코너 9×6**, 즉 인쇄된 무늬가 **10×7칸**인 보드입니다.
+한 칸의 크기를 자로 재어 `--square-mm`에 넣으세요.
+
+```bash
+cd farm_robot
+python3 tools/webcam_checkerboard_calibration.py --square-mm 25 --auto
+```
+
+보드를 화면 중앙에만 두지 말고 모서리·가장자리·가까운 거리·먼 거리와
+여러 기울임으로 움직이세요. `20/20`이 되면 자동 계산합니다.
+수동 모드에서는 `SPACE`로 수집하고 `C` 또는 `ENTER`로 계산합니다.
+
+결과는 `calibration/webcam_0.json`에 저장되며 ArUco 검출기와
+`bringup_monitor.py`가 자동으로 읽습니다. 웹캠 해상도·초점·줌을 바꾸면
+다시 보정해야 합니다. 평균 재투영 오차가 `1.2 px` 이상이면 샘플을 다시 찍으세요.
 
 ### 8-5. 저속 단계 주행
 `BASE_SPEED = 0.2`, `LOG_LEVEL = "DEBUG"` 로 두고 아래 순서로 넓혀 가세요.
